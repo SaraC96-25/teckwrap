@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, parse_qs, urljoin
 import streamlit as st
 
-st.set_page_config(page_title="Downloader + Color CSV (Shopify/Woo/QZVinyls)", layout="wide")
+st.set_page_config(page_title="Downloader + Color CSV (Shopify/Woo/QZVinyls/UPPF)", layout="wide")
 
 # -----------------------
 # HTTP session
@@ -36,6 +36,7 @@ def get_color_name(title: str) -> str:
     - 'Matte Coal Black (MT01) Vinyl Wrap' -> 'Matte Coal Black' (Shopify .com)
     - 'MT04 Matte Metallic Matte Cornflower Blue *DISCONTINUED*' -> 'Matte Cornflower Blue' (Shopify .uk)
     - '600 Moon Halo' -> 'Moon Halo' (QZVinyls)
+    - 'Mirror Black' -> 'Mirror Black' (UPPF)
     """
     title = (title or "").strip()
     title = title.split("*")[0].strip()  # rimuove *DISCONTINUED*
@@ -53,10 +54,11 @@ def get_color_name(title: str) -> str:
     if len(parts) >= 4:
         return " ".join(parts[3:]).strip()
 
+    # UPPF o altri: titolo semplice
     return title
 
 def find_product_title(soup: BeautifulSoup) -> str | None:
-    """Trova il titolo su Shopify (.com/.uk), WooCommerce (.gr, WooMA) e QZVinyls (.fi)."""
+    """Trova il titolo su Shopify (.com/.uk), WooCommerce (.gr, WooMA), QZVinyls (.fi) e UPPF (.com)."""
     for selector in [
         # Shopify
         "h1.product-title",                # teckwrap.com
@@ -69,6 +71,8 @@ def find_product_title(soup: BeautifulSoup) -> str | None:
         "h2.wooma-product-title",
         # QZVinyls
         "h1.ProductName",
+        # UPPF
+        "div.title h1",                    # es. <div class="title ..."><h1>Mirror Black</h1>
     ]:
         t = soup.select_one(selector)
         if t and t.text.strip():
@@ -78,6 +82,11 @@ def find_product_title(soup: BeautifulSoup) -> str | None:
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].strip()
+
+    # Fallback extra UPPF: alt dell'immagine principale
+    pic = soup.select_one("div.info-pic img") or soup.select_one(".info-pic img")
+    if pic and pic.get("alt"):
+        return pic.get("alt").strip()
 
     # Ultimo fallback: <title>
     if soup.title and soup.title.text.strip():
@@ -280,7 +289,7 @@ def extract_images_from_woocommerce(soup: BeautifulSoup, max_images=3):
     return _dedup_order_and_limit(blobs, featured_blob, max_images)
 
 # -----------------------
-# QZVinyls (.fi)  **FIX dedup**
+# QZVinyls (.fi)
 # -----------------------
 def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=3):
     """QZVinyls: usa gli <a.ProductImage> (href -> 1200x1200).
@@ -298,7 +307,7 @@ def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=
 
     urls = [urljoin(page_url, a.get("href")) for a in anchors if a.get("href")]
 
-    # ✅ dedup preservando ordine (FIX UnboundLocalError)
+    # dedup preservando ordine (FIX UnboundLocalError)
     seen = set()
     urls_dedup = [u for u in urls if not (u in seen or seen.add(u))]
 
@@ -317,6 +326,28 @@ def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=
             continue
 
     # 4) dedup/ordina/featured/limite
+    return _dedup_order_and_limit(blobs, featured_blob, max_images)
+
+# -----------------------
+# UPPF (.com)
+# -----------------------
+def extract_images_from_uppf(soup: BeautifulSoup, page_url: str, max_images=1):
+    """UPPF: singola immagine dentro .info-pic img; usa alt come fallback titolo."""
+    img = soup.select_one("div.info-pic img") or soup.select_one(".info-pic img")
+    if not img:
+        return []
+    src = img.get("src") or img.get("data-src")
+    if not src:
+        return []
+    url = urljoin(page_url, src)
+    blobs, featured_blob = [], None
+    try:
+        r = SESSION.get(url, timeout=20)
+        if r.status_code == 200 and r.content:
+            featured_blob = r.content
+            blobs.append(featured_blob)
+    except:
+        return []
     return _dedup_order_and_limit(blobs, featured_blob, max_images)
 
 # -----------------------
@@ -469,6 +500,8 @@ def extract_images_auto(url, soup, max_images=3):
         return extract_images_from_woocommerce(soup, max_images=max_images)
     elif "qzvinyls.fi" in host:
         return extract_images_from_qzvinyls(soup, page_url=url, max_images=max_images)
+    elif "uppf.com" in host:
+        return extract_images_from_uppf(soup, page_url=url, max_images=1)
     else:
         return extract_images_from_shopify(soup, max_images=max_images)
 
@@ -538,11 +571,11 @@ def zip_all(base_dir, csv_files):
 # -----------------------
 # UI
 # -----------------------
-st.title("Downloader + Color CSV (Shopify/Woo/QZVinyls) – Maxtrify-ready")
+st.title("Downloader + Color CSV (Shopify/Woo/QZVinyls/UPPF) – Maxtrify-ready")
 
 st.markdown('''
 Carica un **CSV** con la colonna `url` (o `URL`):  
-- Scarica immagini (max 3 con **featured grande**) da **.com / .uk / .gr / .fi**  
+- Scarica immagini (max 3 con **featured grande**, UPPF=1) da **.com / .uk / .gr / .fi / uppf.com**  
 - Crea sottocartelle per **colore**  
 - Genera CSV **Maxtrify** in blocchi da **10 colori**  
 - Scarica **tutto** in un unico ZIP
