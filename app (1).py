@@ -1,4 +1,3 @@
-
 import os
 import re
 import csv
@@ -21,7 +20,7 @@ import streamlit as st
 st.set_page_config(page_title="TeckWrap Downloader + Color CSV", layout="wide")
 
 # -----------------------
-# HTTP session (headers)
+# HTTP session
 # -----------------------
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -60,85 +59,47 @@ def _abs_url(u: str) -> str:
         return "https://teckwrap.com" + u
     return u
 
-def _width_from_url(u: str) -> int:
-    try:
-        q = parse_qs(urlparse(u).query)
-        if "width" in q and q["width"]:
-            return int(q["width"][0])
-    except:
-        pass
-    return 0
-
-def candidate_urls_from_img(img_tag) -> dict:
-    best_by_base = {}
+def candidate_urls_from_img(img_tag) -> list:
+    urls = []
     srcset = img_tag.get("srcset")
     if srcset:
         for part in srcset.split(","):
-            p = part.strip()
-            if not p:
-                continue
-            seg = p.split()
-            url = _abs_url(seg[0])
-            w = 0
-            if len(seg) > 1 and seg[1].endswith("w"):
-                try:
-                    w = int(seg[1][:-1])
-                except:
-                    w = 0
-            if not url:
-                continue
-            base_key = url.split("?")[0]
-            prev = best_by_base.get(base_key)
-            prev_w = _width_from_url(prev) if prev else 0
-            if w == 0:
-                w = _width_from_url(url)
-            if not prev or w > prev_w:
-                best_by_base[base_key] = url
+            seg = part.strip().split()
+            if seg:
+                urls.append(_abs_url(seg[0]))
     src = img_tag.get("src")
     if src:
-        url = _abs_url(src)
-        base_key = url.split("?")[0]
-        w = _width_from_url(url)
-        prev = best_by_base.get(base_key)
-        prev_w = _width_from_url(prev) if prev else 0
-        if not prev or w > prev_w:
-            best_by_base[base_key] = url
-    return best_by_base
+        urls.append(_abs_url(src))
+    return list(dict.fromkeys(urls))
 
-def get_largest_per_base(image_blobs):
-    best = {}
-    for base_key, blob in image_blobs:
+def extract_images_from_page(soup: BeautifulSoup, max_images=3):
+    image_blobs = []
+    # Cerca immagini in media-gallery e viewer
+    for selector in ["media-gallery img", "ul.media-viewer img"]:
+        for img in soup.select(selector):
+            for url in candidate_urls_from_img(img):
+                try:
+                    r = SESSION.get(url, timeout=20)
+                    if r.status_code == 200 and r.content:
+                        image_blobs.append(r.content)
+                except:
+                    continue
+    return deduplicate_and_limit(image_blobs, max_images=max_images)
+
+def deduplicate_and_limit(images, max_images=3):
+    """Deduplica per hash e mantiene max immagini più grandi"""
+    unique = {}
+    for data in images:
         try:
-            im = Image.open(BytesIO(blob))
+            im = Image.open(BytesIO(data))
             area = im.size[0] * im.size[1]
-        except:
-            area = -1
-        prev = best.get(base_key)
-        prev_area = prev[1] if prev else -1
-        if area > prev_area:
-            best[base_key] = (blob, area)
-    return [v[0] for v in best.values()]
-
-def extract_images_from_page(soup: BeautifulSoup):
-    image_candidates = {}
-    gallery = soup.find("media-gallery")
-    if gallery:
-        for img in gallery.find_all("img"):
-            image_candidates.update(candidate_urls_from_img(img))
-    if not image_candidates:
-        viewer = soup.find("ul", class_="media-viewer")
-        if viewer:
-            for img in viewer.find_all("img"):
-                image_candidates.update(candidate_urls_from_img(img))
-    blobs = []
-    for base_key, url in image_candidates.items():
-        try:
-            r = SESSION.get(url, timeout=30)
-            if r.status_code == 200 and r.content:
-                blobs.append((base_key, r.content))
+            h = hashlib.sha256(data).hexdigest()
+            if h not in unique or area > unique[h][1]:
+                unique[h] = (data, area)
         except:
             continue
-    return get_largest_per_base(blobs)
+    sorted_imgs = sorted(unique.values(), key=lambda x: x[1], reverse=True)
+    return [img for img,_ in sorted_imgs[:max_images]]
 
 def rgb_to_hex(rgb):
     r, g, b = rgb
@@ -159,10 +120,9 @@ def dominant_hex_from_image(img: Image.Image, palette_colors=8):
     for count, idx in counts:
         r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
         h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
-        if l > 0.92 or l < 0.08 or s < 0.15:
-            continue
-        if count > best_count:
-            best = (r, g, b); best_count = count
+        if 0.08 < l < 0.92 and s > 0.15:
+            if count > best_count:
+                best = (r, g, b); best_count = count
     if best is None:
         for count, idx in counts:
             r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
@@ -196,8 +156,8 @@ def slugify_handle(text: str) -> str:
     t = unicodedata.normalize("NFKD", text)
     t = "".join(c for c in t if not unicodedata.combining(c))
     t = t.lower()
-    t = re.sub(r"[^a-z0-9\\s\\-]", "", t)
-    t = re.sub(r"\\s+", "-", t).strip("-")
+    t = re.sub(r"[^a-z0-9\s\-]", "", t)
+    t = re.sub(r"\s+", "-", t).strip("-")
     t = re.sub(r"-{2,}", "-", t)
     return t
 
@@ -262,7 +222,7 @@ def process_urls(df_urls, work_dir, progress=None, log=None):
         try:
             r = SESSION.get(url, timeout=30)
             soup = BeautifulSoup(r.text, "html.parser")
-        except Exception as e:
+        except:
             _log(f"❌ Errore caricamento pagina: {url}")
             continue
         title = find_product_title(soup)
@@ -272,24 +232,16 @@ def process_urls(df_urls, work_dir, progress=None, log=None):
         color_name = get_color_name(title)
         color_dir = os.path.join(work_dir, color_name)
         os.makedirs(color_dir, exist_ok=True)
-        blobs = extract_images_from_page(soup)
+        blobs = extract_images_from_page(soup, max_images=3)
         if not blobs:
             _log(f"⚠️ Nessuna immagine per {color_name}")
             continue
-        saved = 0
         for i, blob in enumerate(blobs, start=1):
             fp = os.path.join(color_dir, f"image_{i}.jpg")
-            try:
-                with open(fp, "wb") as f:
-                    f.write(blob)
-                saved += 1
-            except:
-                pass
-        if saved:
-            collected_colors.append(color_name)
-            _log(f"✅ {saved} immagini salvate per {color_name}")
-        else:
-            _log(f"⚠️ Impossibile salvare immagini per {color_name}")
+            with open(fp, "wb") as f:
+                f.write(blob)
+        collected_colors.append(color_name)
+        _log(f"✅ {len(blobs)} immagini salvate per {color_name}")
     if progress:
         progress.progress(1.0)
     return collected_colors
@@ -312,7 +264,7 @@ st.title("TeckWrap – Downloader + Color CSV (Maxtrify-ready)")
 
 st.markdown('''
 Carica un **CSV** con la colonna `url` (o `URL`): per ogni pagina prodotto verranno scaricate le immagini,
-create le **sottocartelle colore**, calcolato un **HEX** coerente e generati i CSV
+deduplicate, create le **sottocartelle colore**, calcolato un **HEX** coerente e generati i CSV
 **in blocchi da 10 colori** nel formato identico a *last-color-patterns.csv*.
 ''')
 
