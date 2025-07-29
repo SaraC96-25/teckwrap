@@ -45,18 +45,32 @@ def get_color_name(title: str) -> str:
     return title
 
 def find_product_title(soup: BeautifulSoup) -> str | None:
-    # Shopify (.com)
-    t = soup.find("h1", class_="product-title")
-    if t and t.text.strip():
-        return t.text.strip()
-    # Shopify (.uk)
-    t = soup.find("h1", class_="product__title")
-    if t and t.text.strip():
-        return t.text.strip()
-    # WooCommerce (.gr)
-    t = soup.find("h1", class_="product_title") or soup.find("h1", class_="product_title entry-title")
-    if t and t.text.strip():
-        return t.text.strip()
+    """Trova il titolo su Shopify (.com/.uk) e WooCommerce (.gr, WooMA)."""
+    for selector in [
+        # Shopify
+        "h1.product-title",                # teckwrap.com
+        "h1.product__title",               # teckwrap.uk
+        # WooCommerce standard
+        "h1.product_title.entry-title",
+        "h1.product_title",
+        "h1.entry-title",
+        # WooMA / tema custom (come nel tuo caso)
+        "h2.wooma-summary-item.wooma-product-title",
+        "h2.wooma-product-title",
+    ]:
+        t = soup.select_one(selector)
+        if t and t.text.strip():
+            return t.text.strip()
+
+    # Fallback <meta property="og:title">
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].strip()
+
+    # Ultimo fallback: <title>
+    if soup.title and soup.title.text.strip():
+        return soup.title.text.strip()
+
     return None
 
 def _abs_url(u: str) -> str:
@@ -71,14 +85,15 @@ def _abs_url(u: str) -> str:
 # -----------------------
 def candidate_urls_from_img_shopify(img_tag) -> list:
     urls = []
-    # srcset
-    srcset = img_tag.get("srcset") or img_tag.get("data-srcset")
-    if srcset:
-        for part in srcset.split(","):
-            seg = part.strip().split()
-            if seg:
-                urls.append(_abs_url(seg[0]))
-    # src (o data-src)
+    # srcset / data-srcset
+    for attr in ("srcset", "data-srcset"):
+        srcset = img_tag.get(attr)
+        if srcset:
+            for part in srcset.split(","):
+                seg = part.strip().split()
+                if seg:
+                    urls.append(_abs_url(seg[0]))
+    # src / data-src
     for attr in ("src", "data-src"):
         src = img_tag.get(attr)
         if src:
@@ -140,7 +155,7 @@ def extract_images_from_shopify(soup: BeautifulSoup, max_images=3):
 # WooCommerce (.gr)
 # -----------------------
 def candidate_urls_from_img_woo(img_tag) -> list:
-    """Ordine di preferenza: data-large_image > <a href> > srcset > src (+ lazy)."""
+    """Ordine preferenza: data-large_image > <a href> > srcset > src (+ lazy)."""
     urls = []
     # grande esplicito
     for attr in ("data-large_image", "data-large_image_url"):
@@ -165,7 +180,6 @@ def candidate_urls_from_img_woo(img_tag) -> list:
         src = img_tag.get(attr)
         if src:
             urls.append(_abs_url(src))
-
     # dedup preservando ordine
     out, seen = [], set()
     for u in urls:
@@ -174,9 +188,18 @@ def candidate_urls_from_img_woo(img_tag) -> list:
             out.append(u)
     return out
 
+def _download_first_ok(urls, timeout=20):
+    for url in urls:
+        try:
+            r = SESSION.get(url, timeout=timeout)
+            if r.status_code == 200 and r.content:
+                return r.content
+        except:
+            continue
+    return None
+
 def extract_images_from_woocommerce(soup: BeautifulSoup, max_images=3):
-    """Featured (prima della gallery) in versione grande + max 2 altre, dedup hash."""
-    # prendi img della gallery nell’ordine
+    """Featured (prima della gallery) grande + max 2 altre, dedup hash."""
     imgs = soup.select(".woocommerce-product-gallery__image img")
     if not imgs:
         imgs = soup.select("div.woocommerce-product-gallery img")
@@ -199,16 +222,6 @@ def extract_images_from_woocommerce(soup: BeautifulSoup, max_images=3):
 # -----------------------
 # Download + dedup comuni
 # -----------------------
-def _download_first_ok(urls, timeout=20):
-    for url in urls:
-        try:
-            r = SESSION.get(url, timeout=timeout)
-            if r.status_code == 200 and r.content:
-                return r.content
-        except:
-            continue
-    return None
-
 def _dedup_order_and_limit(blobs, featured_blob, max_images):
     if not blobs:
         return []
