@@ -80,6 +80,38 @@ def _abs_url(u: str) -> str:
         return "https:" + u
     return u
 
+# ---- larghezza da query ?width= e da suffisso _NNNx.ext (Shopify vecchi temi) ----
+SIZE_SUFFIX_RE = re.compile(r'_(\d+)x\.(jpg|jpeg|png|webp)$', re.IGNORECASE)
+
+def width_from_url(u: str) -> int:
+    """Estrae la larghezza da ?width=… o dal suffisso _NNNx.ext nel filename."""
+    if not u:
+        return 0
+    try:
+        q = parse_qs(urlparse(u).query)
+        if "width" in q and q["width"]:
+            return int(q["width"][0])
+    except:
+        pass
+    m = SIZE_SUFFIX_RE.search(u.split("?")[0])
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            pass
+    return 0
+
+def width_estimate(u: str) -> int:
+    return width_from_url(u)
+
+def _base_key(u: str) -> str:
+    """Per confrontare featured vs altre: rimuove query e suffisso _NNNx."""
+    if not u:
+        return ""
+    s = u.split("?")[0]
+    s = SIZE_SUFFIX_RE.sub(r'.\2', s)  # toglie _NNNx
+    return s
+
 # -----------------------
 # Shopify (.com / .uk)
 # -----------------------
@@ -99,56 +131,72 @@ def candidate_urls_from_img_shopify(img_tag) -> list:
         if src:
             urls.append(_abs_url(src))
     # dedup preservando ordine
-    out, seen = [], set()
+    seen, out = set(), []
     for u in urls:
         if u and u not in seen:
-            seen.add(u)
-            out.append(u)
+            seen.add(u); out.append(u)
     return out
 
-def width_estimate(url: str) -> int:
-    try:
-        q = parse_qs(urlparse(url).query)
-        if "width" in q and q["width"]:
-            return int(q["width"][0])
-    except:
-        pass
-    return 0
-
 def extract_images_from_shopify(soup: BeautifulSoup, max_images=3):
-    """Featured grande + max altre grandi (dedup hash)."""
-    # 1) individua featured img
-    featured_img = soup.select_one("li.media-viewer__item.is-current-variant img")
+    """Shopify: supporta anche theme con <div class="product-gallery ...">."""
+    # 1) Individua featured <img>
+    featured_img = soup.select_one('div.product-gallery__item[data-index="0"] img')
     if not featured_img:
-        gallery = soup.find("media-gallery") or soup.find("ul", class_="media-viewer")
+        featured_img = soup.select_one("li.media-viewer__item.is-current-variant img")
+    if not featured_img:
+        gallery = (soup.find("media-gallery")
+                   or soup.find("ul", class_="media-viewer")
+                   or soup.find("div", class_="product-gallery"))
         if gallery:
             featured_img = gallery.find("img")
 
     # 2) URL migliore per featured
     featured_url = None
     if featured_img:
-        candidates = candidate_urls_from_img_shopify(featured_img)
-        if candidates:
-            candidates_sorted = sorted(candidates, key=width_estimate, reverse=True)
-            featured_url = candidates_sorted[0]
+        cand = candidate_urls_from_img_shopify(featured_img)
+        if cand:
+            featured_url = sorted(cand, key=width_estimate, reverse=True)[0]
 
-    # 3) scarica tutte le immagini
+    # 3) Scarica tutte le immagini (gallery completa: include anche product-gallery)
     blobs = []
     featured_blob = None
-    for selector in ["media-gallery img", "ul.media-viewer img"]:
+    for selector in ["div.product-gallery img", "media-gallery img", "ul.media-viewer img"]:
         for img in soup.select(selector):
-            for url in candidate_urls_from_img_shopify(img):
+            urls = candidate_urls_from_img_shopify(img)
+            if urls:
+                best = sorted(urls, key=width_estimate, reverse=True)[0]
                 try:
-                    r = SESSION.get(url, timeout=20)
+                    r = SESSION.get(best, timeout=20)
                     if r.status_code == 200 and r.content:
                         data = r.content
-                        if featured_url and url.split("?")[0] == featured_url.split("?")[0]:
+                        if featured_url and _base_key(best) == _base_key(featured_url):
                             featured_blob = data
                         blobs.append(data)
                 except:
                     continue
 
-    # 4) dedup per hash + ordina per area pixel
+    # 4) fallback: <noscript> (alcuni temi Shopify)
+    if not blobs:
+        for ns in soup.select("noscript"):
+            try:
+                frag = BeautifulSoup(ns.text or "", "html.parser")
+            except:
+                continue
+            for img in frag.find_all("img"):
+                urls = candidate_urls_from_img_shopify(img)
+                if urls:
+                    best = sorted(urls, key=width_estimate, reverse=True)[0]
+                    try:
+                        r = SESSION.get(best, timeout=20)
+                        if r.status_code == 200 and r.content:
+                            data = r.content
+                            if featured_url and _base_key(best) == _base_key(featured_url):
+                                featured_blob = data
+                            blobs.append(data)
+                    except:
+                        continue
+
+    # 5) dedup per hash + ordina per area pixel + featured in testa + limite 3
     return _dedup_order_and_limit(blobs, featured_blob, max_images)
 
 # -----------------------
