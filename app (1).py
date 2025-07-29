@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, parse_qs, urljoin
 import streamlit as st
 
-st.set_page_config(page_title="TeckWrap / Partners – Downloader + Color CSV", layout="wide")
+st.set_page_config(page_title="Downloader + Color CSV (Shopify/Woo/QZVinyls)", layout="wide")
 
 # -----------------------
 # HTTP session
@@ -169,7 +169,7 @@ def extract_images_from_shopify(soup: BeautifulSoup, max_images=3):
         if cand:
             featured_url = sorted(cand, key=width_estimate, reverse=True)[0]
 
-    # 3) Scarica tutte le immagini (gallery completa: include anche product-gallery)
+    # 3) Scarica tutte le immagini (gallery completa)
     blobs = []
     featured_blob = None
     for selector in ["div.product-gallery img", "media-gallery img", "ul.media-viewer img"]:
@@ -280,7 +280,7 @@ def extract_images_from_woocommerce(soup: BeautifulSoup, max_images=3):
     return _dedup_order_and_limit(blobs, featured_blob, max_images)
 
 # -----------------------
-# QZVinyls (.fi)
+# QZVinyls (.fi)  **FIX dedup**
 # -----------------------
 def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=3):
     """QZVinyls: usa gli <a.ProductImage> (href -> 1200x1200).
@@ -289,28 +289,23 @@ def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=
     featured_a = (soup.select_one("div.ProductImageSlider .ImageItem.is-selected a.ProductImage")
                   or soup.select_one("div.ProductImageSlider .ImageItem a.ProductImage"))
 
-    featured_url = None
-    if featured_a and featured_a.get("href"):
-        featured_url = urljoin(page_url, featured_a["href"])
+    featured_url = urljoin(page_url, featured_a["href"]) if (featured_a and featured_a.get("href")) else None
 
     # 2) raccogli TUTTE le anchor della slider (e, se serve, delle thumbnails)
     anchors = soup.select("div.ProductImageSlider a.ProductImage")
     if not anchors:
         anchors = soup.select("#ProductThumbnails a.ProductThumbnail")
 
-    urls = []
-    for a in anchors:
-        href = a.get("href")
-        if href:
-            urls.append(urljoin(page_url, href))
+    urls = [urljoin(page_url, a.get("href")) for a in anchors if a.get("href")]
 
-    # dedup preservando ordine
-    seen, urls = set(), [u for u in urls if not (u in seen or seen.add(u))]
+    # ✅ dedup preservando ordine (FIX UnboundLocalError)
+    seen = set()
+    urls_dedup = [u for u in urls if not (u in seen or seen.add(u))]
 
     # 3) scarica (href -> versioni 1200x1200)
     blobs = []
     featured_blob = None
-    for u in urls:
+    for u in urls_dedup:
         try:
             r = SESSION.get(u, timeout=20)
             if r.status_code == 200 and r.content:
