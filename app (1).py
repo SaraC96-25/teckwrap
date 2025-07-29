@@ -72,24 +72,55 @@ def candidate_urls_from_img(img_tag) -> list:
         urls.append(_abs_url(src))
     return list(dict.fromkeys(urls))
 
+def width_estimate(url: str) -> int:
+    try:
+        q = parse_qs(urlparse(url).query)
+        if "width" in q and q["width"]:
+            return int(q["width"][0])
+    except:
+        pass
+    return 0
+
 def extract_images_from_page(soup: BeautifulSoup, max_images=3):
-    image_blobs = []
-    # Cerca immagini in media-gallery e viewer
+    """Estrae immagini garantendo featured image grande come prima"""
+    # 1. Individua featured image
+    featured_img = soup.select_one("li.media-viewer__item.is-current-variant img")
+    if not featured_img:
+        gallery = soup.find("media-gallery") or soup.find("ul", class_="media-viewer")
+        if gallery:
+            featured_img = gallery.find("img")
+
+    # 2. Trova URL migliore per featured image
+    featured_url = None
+    if featured_img:
+        candidates = candidate_urls_from_img(featured_img)
+        if candidates:
+            candidates_sorted = sorted(candidates, key=width_estimate, reverse=True)
+            featured_url = candidates_sorted[0]
+
+    # 3. Scarica tutte le immagini
+    blobs = []
+    featured_blob = None
     for selector in ["media-gallery img", "ul.media-viewer img"]:
         for img in soup.select(selector):
             for url in candidate_urls_from_img(img):
                 try:
                     r = SESSION.get(url, timeout=20)
                     if r.status_code == 200 and r.content:
-                        image_blobs.append(r.content)
+                        data = r.content
+                        # se corrisponde alla featured (stessa base url)
+                        if featured_url and url.split("?")[0] == featured_url.split("?")[0]:
+                            featured_blob = data
+                        blobs.append(data)
                 except:
                     continue
-    return deduplicate_and_limit(image_blobs, max_images=max_images)
 
-def deduplicate_and_limit(images, max_images=3):
-    """Deduplica per hash e mantiene max immagini più grandi"""
+    if not blobs:
+        return []
+
+    # 4. Deduplica per hash e ordina per area pixel
     unique = {}
-    for data in images:
+    for data in blobs:
         try:
             im = Image.open(BytesIO(data))
             area = im.size[0] * im.size[1]
@@ -98,8 +129,16 @@ def deduplicate_and_limit(images, max_images=3):
                 unique[h] = (data, area)
         except:
             continue
+
     sorted_imgs = sorted(unique.values(), key=lambda x: x[1], reverse=True)
-    return [img for img,_ in sorted_imgs[:max_images]]
+    images_ordered = [img for img,_ in sorted_imgs]
+
+    # 5. Metti featured image in testa
+    if featured_blob:
+        images_ordered = [featured_blob] + [img for img in images_ordered if img != featured_blob]
+
+    # 6. Limita a max_images
+    return images_ordered[:max_images]
 
 def rgb_to_hex(rgb):
     r, g, b = rgb
@@ -263,9 +302,9 @@ def zip_folder(base_dir) -> bytes:
 st.title("TeckWrap – Downloader + Color CSV (Maxtrify-ready)")
 
 st.markdown('''
-Carica un **CSV** con la colonna `url` (o `URL`): per ogni pagina prodotto verranno scaricate le immagini,
-deduplicate, create le **sottocartelle colore**, calcolato un **HEX** coerente e generati i CSV
-**in blocchi da 10 colori** nel formato identico a *last-color-patterns.csv*.
+Carica un **CSV** con la colonna `url` (o `URL`): per ogni pagina prodotto verranno scaricate le immagini
+(max 3 con la featured image grande), create le **sottocartelle colore**, calcolato un **HEX** coerente e generati i CSV
+**in blocchi da 10 colori** per Maxtrify.
 ''')
 
 csv_file = st.file_uploader("Carica prodotti.csv (colonna url o URL)", type=["csv"])
