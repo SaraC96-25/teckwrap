@@ -14,10 +14,10 @@ from bs4 import BeautifulSoup
 from PIL import Image
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 import streamlit as st
 
-st.set_page_config(page_title="TeckWrap Downloader + Color CSV", layout="wide")
+st.set_page_config(page_title="TeckWrap / Partners – Downloader + Color CSV", layout="wide")
 
 # -----------------------
 # HTTP session
@@ -32,31 +32,43 @@ SESSION.headers.update({
 # Helpers comuni
 # -----------------------
 def get_color_name(title: str) -> str:
-    """Estrae il nome colore dal titolo, rimuovendo codice e *DISCONTINUED*."""
+    """Estrae il nome colore da vari formati:
+    - 'Matte Coal Black (MT01) Vinyl Wrap' -> 'Matte Coal Black' (Shopify .com)
+    - 'MT04 Matte Metallic Matte Cornflower Blue *DISCONTINUED*' -> 'Matte Cornflower Blue' (Shopify .uk)
+    - '600 Moon Halo' -> 'Moon Halo' (QZVinyls)
+    """
     title = (title or "").strip()
-    title = title.split("*")[0].strip()  # remove *DISCONTINUED*
-    # Shopify .com: "Matte Coal Black (MT01) Vinyl Wrap"
+    title = title.split("*")[0].strip()  # rimuove *DISCONTINUED*
+
+    # Caso classico con parentesi (Shopify .com)
     if "(" in title and ")" in title:
         return title.split("(")[0].strip()
-    # Shopify .uk: "MT04 Matte Metallic Matte Cornflower Blue ..."
+
+    # Caso "CODICE NomeColore" (QZVinyls)
     parts = title.split()
+    if parts and any(ch.isdigit() for ch in parts[0]):
+        return " ".join(parts[1:]).strip()
+
+    # Caso UK "CODICE Tipo Tipo NomeColore"
     if len(parts) >= 4:
         return " ".join(parts[3:]).strip()
+
     return title
 
 def find_product_title(soup: BeautifulSoup) -> str | None:
-    """Trova il titolo su Shopify (.com/.uk) e WooCommerce (.gr, WooMA)."""
+    """Trova il titolo su Shopify (.com/.uk), WooCommerce (.gr, WooMA) e QZVinyls (.fi)."""
     for selector in [
         # Shopify
         "h1.product-title",                # teckwrap.com
         "h1.product__title",               # teckwrap.uk
-        # WooCommerce standard
+        # WooCommerce standard / WooMA
         "h1.product_title.entry-title",
         "h1.product_title",
         "h1.entry-title",
-        # WooMA / tema custom (come nel tuo caso)
         "h2.wooma-summary-item.wooma-product-title",
         "h2.wooma-product-title",
+        # QZVinyls
+        "h1.ProductName",
     ]:
         t = soup.select_one(selector)
         if t and t.text.strip():
@@ -93,7 +105,7 @@ def width_from_url(u: str) -> int:
             return int(q["width"][0])
     except:
         pass
-    m = SIZE_SUFFIX_RE.search(u.split("?")[0])
+    m = SIZE_SUFFIX_RE.search((u or "").split("?")[0])
     if m:
         try:
             return int(m.group(1))
@@ -138,7 +150,7 @@ def candidate_urls_from_img_shopify(img_tag) -> list:
     return out
 
 def extract_images_from_shopify(soup: BeautifulSoup, max_images=3):
-    """Shopify: supporta anche theme con <div class="product-gallery ...">."""
+    """Shopify: supporta anche theme con <div class="product-gallery ..."> e <noscript>."""
     # 1) Individua featured <img>
     featured_img = soup.select_one('div.product-gallery__item[data-index="0"] img')
     if not featured_img:
@@ -265,6 +277,51 @@ def extract_images_from_woocommerce(soup: BeautifulSoup, max_images=3):
             featured_blob = data
         blobs.append(data)
 
+    return _dedup_order_and_limit(blobs, featured_blob, max_images)
+
+# -----------------------
+# QZVinyls (.fi)
+# -----------------------
+def extract_images_from_qzvinyls(soup: BeautifulSoup, page_url: str, max_images=3):
+    """QZVinyls: usa gli <a.ProductImage> (href -> 1200x1200).
+       Featured = prima .ImageItem (o .is-selected)."""
+    # 1) featured anchor
+    featured_a = (soup.select_one("div.ProductImageSlider .ImageItem.is-selected a.ProductImage")
+                  or soup.select_one("div.ProductImageSlider .ImageItem a.ProductImage"))
+
+    featured_url = None
+    if featured_a and featured_a.get("href"):
+        featured_url = urljoin(page_url, featured_a["href"])
+
+    # 2) raccogli TUTTE le anchor della slider (e, se serve, delle thumbnails)
+    anchors = soup.select("div.ProductImageSlider a.ProductImage")
+    if not anchors:
+        anchors = soup.select("#ProductThumbnails a.ProductThumbnail")
+
+    urls = []
+    for a in anchors:
+        href = a.get("href")
+        if href:
+            urls.append(urljoin(page_url, href))
+
+    # dedup preservando ordine
+    seen, urls = set(), [u for u in urls if not (u in seen or seen.add(u))]
+
+    # 3) scarica (href -> versioni 1200x1200)
+    blobs = []
+    featured_blob = None
+    for u in urls:
+        try:
+            r = SESSION.get(u, timeout=20)
+            if r.status_code == 200 and r.content:
+                data = r.content
+                if featured_url and u.split("?")[0] == featured_url.split("?")[0]:
+                    featured_blob = data
+                blobs.append(data)
+        except:
+            continue
+
+    # 4) dedup/ordina/featured/limite
     return _dedup_order_and_limit(blobs, featured_blob, max_images)
 
 # -----------------------
@@ -415,6 +472,8 @@ def extract_images_auto(url, soup, max_images=3):
     host = urlparse(url).netloc.lower()
     if "teckwrap.gr" in host:
         return extract_images_from_woocommerce(soup, max_images=max_images)
+    elif "qzvinyls.fi" in host:
+        return extract_images_from_qzvinyls(soup, page_url=url, max_images=max_images)
     else:
         return extract_images_from_shopify(soup, max_images=max_images)
 
@@ -484,11 +543,11 @@ def zip_all(base_dir, csv_files):
 # -----------------------
 # UI
 # -----------------------
-st.title("TeckWrap – Downloader + Color CSV (Maxtrify-ready)")
+st.title("Downloader + Color CSV (Shopify/Woo/QZVinyls) – Maxtrify-ready")
 
 st.markdown('''
 Carica un **CSV** con la colonna `url` (o `URL`):  
-- Scarica immagini (max 3 con **featured grande**) da **.com / .uk / .gr**  
+- Scarica immagini (max 3 con **featured grande**) da **.com / .uk / .gr / .fi**  
 - Crea sottocartelle per **colore**  
 - Genera CSV **Maxtrify** in blocchi da **10 colori**  
 - Scarica **tutto** in un unico ZIP
@@ -548,6 +607,6 @@ if run:
         st.success("✅ Completato! Tutti i file sono pronti.")
         st.download_button("⬇️ Scarica tutto (immagini + CSV)",
                            data=all_zip,
-                           file_name="teckwrap-package.zip",
+                           file_name="package-images-and-csv.zip",
                            mime="application/zip")
         st.write("Colori estratti:", sorted(set(colors)))
