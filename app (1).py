@@ -285,14 +285,23 @@ def process_urls(df_urls, work_dir, progress=None, log=None):
         progress.progress(1.0)
     return collected_colors
 
-def zip_folder(base_dir) -> bytes:
+def zip_all(base_dir, csv_files):
+    """
+    Crea un unico zip con:
+    - cartelle immagini
+    - file CSV nella root
+    """
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        # aggiungi cartelle immagini
         for root, _, files in os.walk(base_dir):
             for f in files:
                 fp = os.path.join(root, f)
                 arc = os.path.relpath(fp, base_dir)
                 z.write(fp, arc)
+        # aggiungi CSV
+        for name, content in csv_files:
+            z.writestr(name, content)
     bio.seek(0)
     return bio.read()
 
@@ -302,9 +311,11 @@ def zip_folder(base_dir) -> bytes:
 st.title("TeckWrap – Downloader + Color CSV (Maxtrify-ready)")
 
 st.markdown('''
-Carica un **CSV** con la colonna `url` (o `URL`): per ogni pagina prodotto verranno scaricate le immagini
-(max 3 con la featured image grande), create le **sottocartelle colore**, calcolato un **HEX** coerente e generati i CSV
-**in blocchi da 10 colori** per Maxtrify.
+Carica un **CSV** con la colonna `url` (o `URL`):  
+- Scarica immagini (max 3 con featured grande)  
+- Crea sottocartelle per colore  
+- Genera CSV Maxtrify-ready in blocchi da 10 colori  
+- Scarica tutto in un unico ZIP
 ''')
 
 csv_file = st.file_uploader("Carica prodotti.csv (colonna url o URL)", type=["csv"])
@@ -353,13 +364,14 @@ if run:
 
         # genera CSV (max 10 colori per file)
         csv_names, csv_buffers = generate_color_csvs(colors, work_dir)
+        csv_files = list(zip(csv_names, csv_buffers))
 
-        # pacchetto zip con cartelle immagini
-        st.success("Completato.")
-        zbytes = zip_folder(work_dir)
-        st.download_button("Scarica immagini (zip)", data=zbytes, file_name="teckwrap-images.zip", mime="application/zip")
+        # pacchetto unico zip
+        all_zip = zip_all(work_dir, csv_files)
 
-        for name, content in zip(csv_names, csv_buffers):
-            st.download_button(f"Scarica {name}", data=content, file_name=name, mime="text/csv")
-
+        st.success("✅ Completato! Tutti i file sono pronti.")
+        st.download_button("⬇️ Scarica tutto (immagini + CSV)", 
+                           data=all_zip, 
+                           file_name="teckwrap-package.zip", 
+                           mime="application/zip")
         st.write("Colori estratti:", sorted(set(colors)))
