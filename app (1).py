@@ -3,8 +3,9 @@ import os
 import re
 import csv
 import hashlib
+import zipfile
 from io import BytesIO
-from typing import List, Dict
+from typing import List, Dict, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -14,15 +15,14 @@ from PIL import Image
 import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import zipfile
 
 # ------------------------------
 # Config base (posizioni 1-based)
 # ------------------------------
-DEFAULT_POSITIONS = [3, 5, 6]  # es. come nel caso "Racing Red"
-MAX_IMAGES = 3                 # sempre max 3 immagini per colore
+DEFAULT_POSITIONS = [3, 5, 6]  # es. come nell’esempio Racing Red
+MAX_IMAGES = 3                 # max 3 immagini per colore
 
-# Esclusioni (quando si riempiono i "buchi")
+# Esclusioni quando si riempiono buchi (opzionale)
 EXCLUDE_PATTERNS = [
     re.compile(r"/1-28\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/146\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
@@ -44,7 +44,7 @@ SESSION.headers.update({
 def is_tekalab(url: str) -> bool:
     return "tekalab.com" in urlparse(url).netloc.lower()
 
-def fetch_soup(url: str) -> BeautifulSoup | None:
+def fetch_soup(url: str) -> Optional[BeautifulSoup]:
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
@@ -53,29 +53,60 @@ def fetch_soup(url: str) -> BeautifulSoup | None:
         st.write(f"❌ Errore richiesta: {url} → {e}")
         return None
 
-def find_title_text(soup: BeautifulSoup) -> str | None:
+def find_title_text(soup: BeautifulSoup) -> Optional[str]:
+    # Titolo principale
     t = soup.select_one("h1.fusion-title-heading")
     if t and t.text.strip():
         return t.text.strip()
+    # Fallback og:title
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].strip()
+    # Fallback <title>
     if soup.title and soup.title.text.strip():
         return soup.title.text.strip()
     return None
 
 def get_color_from_title(title: str) -> str:
-    # "FLEXISHIELD Cosmétique PPF CL-02 Racing Red" -> "Racing Red"
-    m = re.search(r"PPF\s+[A-Z0-9\-]+\s+(.+)$", title, re.IGNORECASE)
+    """
+    Estrae il nome colore dai titoli Tekalab.
+      - 'FLEXISHIELD Cosmétique PPF CL-02 Racing Red'       -> 'Racing Red'
+      - 'Film PPF couleur Corail – FLEXISHIELD CL-01 Coral' -> 'Coral'
+      - 'Film PPF violet pourpre – CL-17 Brunello'          -> 'Brunello'
+      - 'Film PPF noir profond – CL-08 Pitch Black 2.0'     -> 'Pitch Black 2.0'
+    Regole:
+      1) se esiste 'CL-<num>[letter]? <colore>' prende tutto dopo il codice;
+      2) altrimenti dopo l’ultimo trattino lungo/medio/semplice;
+      3) fallback: ultime 2-3 parole.
+    """
+    if not title:
+        return ""
+    # normalizza trattini
+    t = title.replace("\u2013", "-").replace("\u2014", "-")
+    t = " ".join(t.split()).strip()
+
+    m = re.search(r"(?:^|[-\s])CL[-\s]?\d+[A-Z]?\s+(.+)$", t, re.IGNORECASE)
     if m:
-        return m.group(1).strip()
-    parts = title.split()
-    return " ".join(parts[-2:]).strip() if len(parts) >= 2 else title.strip()
+        color = m.group(1).strip()
+        return color.strip("–-—:;,. ").strip()
+
+    if "-" in t:
+        seg = t.split("-")[-1].strip()
+        if seg:
+            return seg
+
+    parts = t.split()
+    if len(parts) >= 3:
+        return " ".join(parts[-3:]).strip()
+    if len(parts) >= 2:
+        return " ".join(parts[-2:]).strip()
+    return t
 
 def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
     """
     Avada/Woo: link full-size in:
-    div.woocommerce-product-gallery__wrapper > div.woocommerce-product-gallery__image:not(.clone) a[href]
+    div.woocommerce-product-gallery__wrapper >
+      div.woocommerce-product-gallery__image:not(.clone) a[href]
     """
     urls = []
     sel = "div.woocommerce-product-gallery__wrapper div.woocommerce-product-gallery__image:not(.clone) a[href]"
@@ -209,7 +240,7 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
 
 def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
     """
-    Ritorna [(filename, csv_content), ...] con max 10 colori per file.
+    Restituisce [(filename, csv_content), ...] con max 10 colori per file.
     """
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
@@ -242,12 +273,12 @@ st.title("Tekalab → Immagini per posizione + CSV Maxtrify")
 st.markdown("""
 Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
 Per ogni pagina:
-- estrae il **colore** dal titolo,
+- estrae il **colore** dal titolo (copre Coral, Brunello, Pitch Black 2.0, ecc.),
 - prende le **immagini in posizioni** di gallery (default **3, 5, 6**),
 - salva **max 3** immagini per colore (dedup hash, ordine preservato),
 - calcola un **HEX** dominante,
 - genera CSV **Maxtrify** in file da **10 colori**,
-- ti fa scaricare **tutto** in **un unico ZIP**.
+- scarica **tutto** in **un unico ZIP**.
 """)
 
 uploaded = st.file_uploader("Carica prodotti.csv (colonna url)", type=["csv"])
@@ -276,6 +307,7 @@ if run:
         st.error(f"Errore lettura CSV: {e}")
         st.stop()
 
+    # trova colonna url
     url_col = None
     for c in df.columns:
         if c.strip().lower() == "url":
