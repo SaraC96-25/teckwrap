@@ -1,57 +1,57 @@
+import io
 import os
 import re
 import csv
-import io
 import hashlib
 from io import BytesIO
+from typing import List, Dict
 from urllib.parse import urlparse
 
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 from PIL import Image
+import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import zipfile
 
-# =========================
-# Configurazione mirata Tekalab
-# =========================
-# Posizioni 1-based nella gallery (ignora gli elementi .clone)
-GALLERY_POSITIONS = [3, 5, 6]  # es. CL-02: ...-01.jpg, 145.jpg, ...-08.jpg
-MAX_IMAGES = 3
+# ------------------------------
+# Config base (posizioni 1-based)
+# ------------------------------
+DEFAULT_POSITIONS = [3, 5, 6]  # es. come nel caso "Racing Red"
+MAX_IMAGES = 3                 # sempre max 3 immagini per colore
 
-# Esclusioni (URL da evitare quando si riempiono buchi se mancano posizioni richieste)
+# Esclusioni (quando si riempiono i "buchi")
 EXCLUDE_PATTERNS = [
     re.compile(r"/1-28\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/146\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/149\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
 ]
 
-CSV_INPUT = "prodotti.csv"
-
-# =========================
-# HTTP
-# =========================
+# ------------------------------
+# HTTP session
+# ------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 })
 
-# =========================
-# Utils
-# =========================
+# ------------------------------
+# Helpers di scraping Tekalab
+# ------------------------------
+def is_tekalab(url: str) -> bool:
+    return "tekalab.com" in urlparse(url).netloc.lower()
+
 def fetch_soup(url: str) -> BeautifulSoup | None:
     try:
         r = SESSION.get(url, timeout=30)
         r.raise_for_status()
         return BeautifulSoup(r.text, "html.parser")
     except Exception as e:
-        print(f"❌ Errore richiesta pagina: {url} -> {e}")
+        st.write(f"❌ Errore richiesta: {url} → {e}")
         return None
-
-def is_tekalab(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return "tekalab.com" in host
 
 def find_title_text(soup: BeautifulSoup) -> str | None:
     t = soup.select_one("h1.fusion-title-heading")
@@ -65,45 +65,34 @@ def find_title_text(soup: BeautifulSoup) -> str | None:
     return None
 
 def get_color_from_title(title: str) -> str:
-    """
-    'FLEXISHIELD Cosmétique PPF CL-02 Racing Red' -> 'Racing Red'
-    Regola: prendi il testo dopo 'PPF <CODICE> ' se presente; altrimenti le ultime 2 parole.
-    """
-    t = (title or "").strip()
-    m = re.search(r"PPF\s+[A-Z0-9\-]+\s+(.+)$", t, re.IGNORECASE)
+    # "FLEXISHIELD Cosmétique PPF CL-02 Racing Red" -> "Racing Red"
+    m = re.search(r"PPF\s+[A-Z0-9\-]+\s+(.+)$", title, re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    parts = t.split()
-    if len(parts) >= 2:
-        return " ".join(parts[-2:]).strip()
-    return t
+    parts = title.split()
+    return " ".join(parts[-2:]).strip() if len(parts) >= 2 else title.strip()
 
-def gallery_fullsize_urls(soup: BeautifulSoup) -> list[str]:
+def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
     """
-    Link full-size ordinati:
+    Avada/Woo: link full-size in:
     div.woocommerce-product-gallery__wrapper > div.woocommerce-product-gallery__image:not(.clone) a[href]
     """
     urls = []
-    for a in soup.select(
-        "div.woocommerce-product-gallery__wrapper div.woocommerce-product-gallery__image:not(.clone) a[href]"
-    ):
+    sel = "div.woocommerce-product-gallery__wrapper div.woocommerce-product-gallery__image:not(.clone) a[href]"
+    for a in soup.select(sel):
         href = (a.get("href") or "").strip()
         if href.lower().startswith("http"):
             urls.append(href)
-
     # dedup preservando ordine
-    seen = set()
-    out = []
+    seen, out = set(), []
     for u in urls:
         if u not in seen:
-            seen.add(u)
-            out.append(u)
+            seen.add(u); out.append(u)
     return out
 
-def pick_by_positions(urls: list[str], positions: list[int], max_images: int) -> list[str]:
-    """Sceglie per posizioni 1-based; se mancano, riempie con i successivi non esclusi."""
+def pick_by_positions(urls: List[str], positions: List[int], max_images: int) -> List[str]:
     chosen = []
-    # 1) posizioni richieste
+    # posizioni 1-based
     for pos in positions:
         idx = pos - 1
         if 0 <= idx < len(urls):
@@ -111,7 +100,7 @@ def pick_by_positions(urls: list[str], positions: list[int], max_images: int) ->
         if len(chosen) >= max_images:
             return chosen[:max_images]
 
-    # 2) riempimento
+    # riempimento con altre immagini non escluse
     def is_excluded(u: str) -> bool:
         return any(p.search(u) for p in EXCLUDE_PATTERNS)
 
@@ -121,23 +110,23 @@ def pick_by_positions(urls: list[str], positions: list[int], max_images: int) ->
         if u in chosen or is_excluded(u):
             continue
         chosen.append(u)
-
     return chosen[:max_images]
 
+# ------------------------------
+# Immagini, dedup, HEX
+# ------------------------------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def dedup_by_hash_keep_order(blobs: list[bytes]) -> list[bytes]:
-    seen = set()
-    out = []
+def dedup_by_hash_keep_order(blobs: List[bytes]) -> List[bytes]:
+    seen, out = set(), []
     for data in blobs:
         try:
             h = sha256_bytes(data)
         except Exception:
             continue
         if h not in seen:
-            seen.add(h)
-            out.append(data)
+            seen.add(h); out.append(data)
     return out
 
 def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
@@ -156,30 +145,25 @@ def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
     q = img.quantize(colors=palette_colors, method=Image.MEDIANCUT)
     palette = q.getpalette()
     counts = q.getcolors() or []
-    best = None
-    best_count = -1
+    best, best_count = None, -1
+
     for count, idx in counts:
         r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
         h_, l_, s_ = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
         if 0.08 < l_ < 0.92 and s_ > 0.15 and count > best_count:
-            best = (r, g, b); best_count = count
+            best, best_count = (r, g, b), count
     if best is None:
         for count, idx in counts:
             r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
             if count > best_count:
-                best = (r, g, b); best_count = count
+                best, best_count = (r, g, b), count
     return rgb_to_hex(best) if best else ""
 
-def dominant_hex_from_folder(folder_path: str) -> str:
+def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
     candidates = []
-    if not os.path.isdir(folder_path):
-        return ""
-    for name in sorted(os.listdir(folder_path)):
-        if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-            continue
-        fp = os.path.join(folder_path, name)
+    for data in blobs:
         try:
-            with Image.open(fp) as im:
+            with Image.open(BytesIO(data)) as im:
                 hv = dominant_hex_from_image(im, palette_colors=8)
                 if hv:
                     candidates.append(hv.upper())
@@ -187,15 +171,14 @@ def dominant_hex_from_folder(folder_path: str) -> str:
             continue
     if not candidates:
         return ""
-    # moda semplice
     freq = {}
     for c in candidates:
         freq[c] = freq.get(c, 0) + 1
     return max(freq.items(), key=lambda x: x[1])[0]
 
-# =========================
-# CSV Maxtrify (come last-color-patterns.csv)
-# =========================
+# ------------------------------
+# CSV Maxtrify (blocchi da 10)
+# ------------------------------
 def slugify_handle(text: str) -> str:
     import unicodedata
     t = unicodedata.normalize("NFKD", text)
@@ -206,10 +189,9 @@ def slugify_handle(text: str) -> str:
     return t.lower()
 
 def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -> list[dict]:
-    handle = slugify_handle(color_name)
     base = {
         "ID": "",
-        "Handle": handle,
+        "Handle": slugify_handle(color_name),
         "Command": "MERGE",
         "Display Name": color_name,
         "Status": "",
@@ -225,130 +207,172 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
     rows.append({**base, "Top Row": "",   "Row #": 5, "Field": "pattern_taxonomy_reference", "Value": "gid://shopify/TaxonomyValue/2874"})
     return rows
 
-def write_chunked_color_csvs(colors: list[str], base_dir: str) -> list[str]:
-    colors = sorted(set(c for c in colors if c.strip()))
-    if not colors:
-        return []
+def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
+    """
+    Ritorna [(filename, csv_content), ...] con max 10 colori per file.
+    """
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
-
     fieldnames = [
         "ID", "Handle", "Command", "Display Name", "Status", "Updated At",
         "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"
     ]
 
-    os.makedirs(base_dir, exist_ok=True)
-    out_files = []
-    chunk_size = 10
-    for i in range(0, len(colors), chunk_size):
-        chunk = colors[i:i+chunk_size]
+    colors = sorted(colors_hex.keys())
+    chunks = []
+    for i in range(0, len(colors), 10):
+        chunk = colors[i:i+10]
         rows = []
         for color in chunk:
-            folder = os.path.join(base_dir, color)
-            hex_val = dominant_hex_from_folder(folder) or ""
-            rows.extend(build_rows_for_color(color, updated_at, hex_val))
-        idx = (i // chunk_size) + 1
-        csv_name = os.path.join(base_dir, f"color-patterns-{idx:02d}.csv")
-        with open(csv_name, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            w.writerows(rows)
-        out_files.append(csv_name)
-    return out_files
+            rows.extend(build_rows_for_color(color, updated_at, colors_hex[color]))
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+        name = f"color-patterns-{(i//10)+1:02d}.csv"
+        chunks.append((name, buf.getvalue()))
+    return chunks
 
-# =========================
-# Core: 1 URL Tekalab -> cartella colore + 3 immagini
-# =========================
-def process_tekalab_url(url: str, base_dir: str) -> str | None:
-    if not is_tekalab(url):
-        print(f"⚠️ URL ignorato (non tekalab.com): {url}")
-        return None
+# ------------------------------
+# Streamlit UI
+# ------------------------------
+st.set_page_config(page_title="Tekalab Downloader + Color CSV", layout="wide")
+st.title("Tekalab → Immagini per posizione + CSV Maxtrify")
 
-    soup = fetch_soup(url)
-    if not soup:
-        return None
+st.markdown("""
+Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
+Per ogni pagina:
+- estrae il **colore** dal titolo,
+- prende le **immagini in posizioni** di gallery (default **3, 5, 6**),
+- salva **max 3** immagini per colore (dedup hash, ordine preservato),
+- calcola un **HEX** dominante,
+- genera CSV **Maxtrify** in file da **10 colori**,
+- ti fa scaricare **tutto** in **un unico ZIP**.
+""")
 
-    title = find_title_text(soup)
-    if not title:
-        print(f"❌ Titolo non trovato: {url}")
-        return None
+uploaded = st.file_uploader("Carica prodotti.csv (colonna url)", type=["csv"])
+pos_str = st.text_input("Posizioni gallery (1-based, separate da virgola)", value="3,5,6")
+run = st.button("Esegui")
 
-    color = get_color_from_title(title)
-    color_dir = os.path.join(base_dir, color)
-    os.makedirs(color_dir, exist_ok=True)
-
-    urls = gallery_fullsize_urls(soup)
-    if not urls:
-        print(f"⚠️ Nessuna immagine trovata in gallery: {url}")
-        return None
-
-    wanted = pick_by_positions(urls, GALLERY_POSITIONS, MAX_IMAGES)
-    if not wanted:
-        print(f"⚠️ Impossibile selezionare immagini per {color}")
-        return None
-
-    blobs = []
-    for u in wanted:
+def parse_positions(s: str) -> List[int]:
+    out = []
+    for part in s.split(","):
         try:
-            r = SESSION.get(u, timeout=30)
-            if r.status_code == 200 and r.content:
-                blobs.append(r.content)
-        except Exception:
+            n = int(part.strip())
+            if n > 0:
+                out.append(n)
+        except:
+            pass
+    return out or DEFAULT_POSITIONS
+
+if run:
+    if not uploaded:
+        st.error("Carica prima un CSV.")
+        st.stop()
+
+    try:
+        df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Errore lettura CSV: {e}")
+        st.stop()
+
+    url_col = None
+    for c in df.columns:
+        if c.strip().lower() == "url":
+            url_col = c
+            break
+    if not url_col:
+        st.error("Il CSV deve avere una colonna 'url'.")
+        st.stop()
+
+    urls = [u for u in df[url_col].astype(str).tolist() if u.strip()]
+    urls = [u for u in urls if is_tekalab(u)]
+    if not urls:
+        st.warning("Nessun URL tekalab.com valido nel CSV.")
+        st.stop()
+
+    positions = parse_positions(pos_str)
+
+    progress = st.progress(0)
+    log_box = st.empty()
+    logs = []
+    def log(msg):
+        logs.append(msg)
+        log_box.write("\n".join(logs[-25:]))
+
+    colors_map: Dict[str, List[bytes]] = {}   # colore -> [image_bytes...]
+    colors_hex: Dict[str, str] = {}           # colore -> hex
+
+    total = len(urls)
+    for idx, url in enumerate(urls, start=1):
+        progress.progress((idx-1)/max(total,1))
+        soup = fetch_soup(url)
+        if not soup:
+            log(f"❌ Pagina non caricata: {url}")
             continue
 
-    blobs = dedup_by_hash_keep_order(blobs)
-    if not blobs:
-        print(f"⚠️ Nessuna immagine scaricata per {color}")
-        return None
+        title = find_title_text(soup)
+        if not title:
+            log(f"❌ Titolo non trovato: {url}")
+            continue
 
-    # salva file
-    for i, data in enumerate(blobs[:MAX_IMAGES], start=1):
-        fp = os.path.join(color_dir, f"image_{i}.jpg")
-        try:
-            with open(fp, "wb") as f:
-                f.write(data)
-        except Exception:
-            pass
+        color = get_color_from_title(title)
+        gallery_urls = gallery_fullsize_urls(soup)
+        if not gallery_urls:
+            log(f"⚠️ Nessuna immagine in gallery per {color}")
+            continue
 
-    print(f"✅ {len(blobs[:MAX_IMAGES])} immagini salvate per {color}")
-    return color
+        wanted = pick_by_positions(gallery_urls, positions, MAX_IMAGES)
+        if not wanted:
+            log(f"⚠️ Impossibile selezionare immagini per {color}")
+            continue
 
-# =========================
-# Batch: legge prodotti.csv e crea CSV colori
-# =========================
-def run_batch(csv_input: str, output_root: str):
-    if not os.path.exists(csv_input):
-        print(f"❌ CSV non trovato: {csv_input}")
-        return
+        blobs = []
+        for u in wanted:
+            try:
+                r = SESSION.get(u, timeout=30)
+                if r.status_code == 200 and r.content:
+                    blobs.append(r.content)
+            except:
+                continue
 
-    with open(csv_input, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        urls = [row.get("url", "").strip() for row in reader if row.get("url", "").strip()]
+        blobs = dedup_by_hash_keep_order(blobs)[:MAX_IMAGES]
+        if not blobs:
+            log(f"⚠️ Nessuna immagine scaricata per {color}")
+            continue
 
-    if not urls:
-        print("⚠️ Nessun URL valido nel CSV.")
-        return
+        colors_map[color] = blobs
+        colors_hex[color] = dominant_hex_from_blobs(blobs)
+        log(f"✅ {len(blobs)} immagini per {color}")
 
-    colors = []
-    for u in urls:
-        c = process_tekalab_url(u, output_root)
-        if c:
-            colors.append(c)
+    progress.progress(1.0)
 
-    if not colors:
-        print("⚠️ Nessun colore processato.")
-        return
+    if not colors_map:
+        st.warning("Nessun colore processato.")
+        st.stop()
 
-    csv_files = write_chunked_color_csvs(colors, output_root)
-    print("🎉 Completato.")
-    if csv_files:
-        for name in csv_files:
-            print(f"   • CSV generato: {name}")
+    # CSV (blocchi da 10)
+    csv_chunks = make_color_csv_chunks(colors_hex)
 
-# =========================
-# Main
-# =========================
-if __name__ == "__main__":
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    OUTPUT_DIR = BASE_DIR  # sottocartelle colore e CSV nello stesso path dello script
-    run_batch(os.path.join(BASE_DIR, CSV_INPUT), OUTPUT_DIR)
+    # ZIP unico in memoria (cartelle colore + CSV in root)
+    zip_bytes = io.BytesIO()
+    with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
+        # immagini
+        for color, blobs in colors_map.items():
+            for i, data in enumerate(blobs, start=1):
+                arcname = os.path.join(color, f"image_{i}.jpg")
+                z.writestr(arcname, data)
+        # CSV
+        for name, content in csv_chunks:
+            z.writestr(name, content)
+    zip_bytes.seek(0)
+
+    st.success("Completato!")
+    st.download_button(
+        "⬇️ Scarica tutto (immagini + CSV)",
+        data=zip_bytes.getvalue(),
+        file_name="tekalab-package.zip",
+        mime="application/zip",
+    )
+
+    st.write("Colori estratti:", sorted(colors_map.keys()))
