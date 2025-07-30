@@ -19,10 +19,10 @@ from zoneinfo import ZoneInfo
 # ------------------------------
 # Config base (posizioni 1-based)
 # ------------------------------
-DEFAULT_POSITIONS = [3, 5, 6]  # es. come nell’esempio Racing Red
+DEFAULT_POSITIONS = [3, 5, 6]  # es. come nell’esempio "Racing Red"
 MAX_IMAGES = 3                 # max 3 immagini per colore
 
-# Esclusioni quando si riempiono buchi (opzionale)
+# Esclusioni opzionali quando si riempiono buchi
 EXCLUDE_PATTERNS = [
     re.compile(r"/1-28\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/146\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
@@ -54,54 +54,91 @@ def fetch_soup(url: str) -> Optional[BeautifulSoup]:
         return None
 
 def find_title_text(soup: BeautifulSoup) -> Optional[str]:
-    # Titolo principale
     t = soup.select_one("h1.fusion-title-heading")
     if t and t.text.strip():
         return t.text.strip()
-    # Fallback og:title
     og = soup.find("meta", property="og:title")
     if og and og.get("content"):
         return og["content"].strip()
-    # Fallback <title>
     if soup.title and soup.title.text.strip():
         return soup.title.text.strip()
     return None
 
-def get_color_from_title(title: str) -> str:
-    """
-    Estrae il nome colore dai titoli Tekalab.
-      - 'FLEXISHIELD Cosmétique PPF CL-02 Racing Red'       -> 'Racing Red'
-      - 'Film PPF couleur Corail – FLEXISHIELD CL-01 Coral' -> 'Coral'
-      - 'Film PPF violet pourpre – CL-17 Brunello'          -> 'Brunello'
-      - 'Film PPF noir profond – CL-08 Pitch Black 2.0'     -> 'Pitch Black 2.0'
-    Regole:
-      1) se esiste 'CL-<num>[letter]? <colore>' prende tutto dopo il codice;
-      2) altrimenti dopo l’ultimo trattino lungo/medio/semplice;
-      3) fallback: ultime 2-3 parole.
-    """
-    if not title:
-        return ""
-    # normalizza trattini
-    t = title.replace("\u2013", "-").replace("\u2014", "-")
-    t = " ".join(t.split()).strip()
+# ------- Estrazione colore (titolo, testo pagina, slug) -------
+CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"  # espandibile se necessario
 
-    m = re.search(r"(?:^|[-\s])CL[-\s]?\d+[A-Z]?\s+(.+)$", t, re.IGNORECASE)
+def _normalize_dashes(s: str) -> str:
+    return s.replace("\u2013", "-").replace("\u2014", "-")
+
+def _extract_code_from_url(url: str) -> Optional[str]:
+    slug = urlparse(url).path.lower()
+    m = re.search(r"/(cl)[-\s]?(\d+[a-z]?)(?:/|[-])", slug, re.IGNORECASE)
     if m:
-        color = m.group(1).strip()
-        return color.strip("–-—:;,. ").strip()
+        return (m.group(1).upper() + "-" + m.group(2).upper())
+    return None
 
+def _clean_color_piece(x: str) -> str:
+    x = re.split(r"[|•·\(\)\[\]{}]|€|TTC|HT", x, 1)[0]
+    return x.strip(" .,:;–—-").strip()
+
+def _extract_from_title(title: str) -> Optional[str]:
+    if not title:
+        return None
+    t = _normalize_dashes(" ".join(title.split()).strip())
+    # caso: "… PPF CL-02 Racing Red" / "… CL-17 Brunello" / "… CL-08 Pitch Black 2.0"
+    m = re.search(rf"(?:^|[-\s]){CODE_PREFIXES}[-\s]?\d+[A-Z]?\s+(.+)$", t, re.IGNORECASE)
+    if m:
+        return _clean_color_piece(m.group(1))
+    # fallback: porzione dopo l'ultimo trattino
     if "-" in t:
         seg = t.split("-")[-1].strip()
         if seg:
-            return seg
+            return _clean_color_piece(seg)
+    return None
 
-    parts = t.split()
-    if len(parts) >= 3:
-        return " ".join(parts[-3:]).strip()
+def _extract_from_text(soup: BeautifulSoup, code_hint: Optional[str]) -> Optional[str]:
+    text = " ".join(list(soup.stripped_strings))[:40000]
+    text = _normalize_dashes(text)
+    if code_hint:
+        ch = re.escape(code_hint)
+        m = re.search(rf"{ch}\s+([A-Z][A-Za-z0-9 .+'/–—\-]*?)\b(?=\s[A-Z][a-z]|[\.\,!;:\)]|\s[0-9€]|$)", text)
+        if m:
+            return _clean_color_piece(m.group(1))
+    m = re.search(rf"{CODE_PREFIXES}[-\s]?\d+[A-Z]?\s+([A-Z][A-Za-z0-9 .+'/–—\-]*?)\b(?=\s[A-Z][a-z]|[\.\,!;:\)]|\s[0-9€]|$)", text)
+    if m:
+        return _clean_color_piece(m.group(1))
+    return None
+
+def _extract_from_slug(url: str) -> Optional[str]:
+    # es. /flexishield-cosmetique-ppf-cl-18-lavender-lust-2-0-2/
+    path = urlparse(url).path.lower()
+    path = path.strip("/").split("/")
+    slug = path[-1] if path else ""
+    parts = re.split(r"cl[-]?\d+[a-z]?[-]?", slug)
     if len(parts) >= 2:
-        return " ".join(parts[-2:]).strip()
-    return t
+        tail = parts[1]
+        # normalizza "2-0" -> "2.0" (non rimuove "2.0")
+        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)
+        tail = re.sub(r"-\d$", "", tail)  # rimuove eventuale "-2" finale duplicato
+        color = _clean_color_piece(tail.replace("-", " ").title())
+        return color if color else None
+    return None
 
+def get_color_from_page(soup: BeautifulSoup, url: str) -> str:
+    title = find_title_text(soup)
+    c = _extract_from_title(title) if title else None
+    if c:
+        return c
+    code_hint = _extract_code_from_url(url)
+    c = _extract_from_text(soup, code_hint)
+    if c:
+        return c
+    c = _extract_from_slug(url)
+    if c:
+        return c
+    return (title or "").strip()
+
+# ------- Gallery -------
 def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
     """
     Avada/Woo: link full-size in:
@@ -130,11 +167,9 @@ def pick_by_positions(urls: List[str], positions: List[int], max_images: int) ->
             chosen.append(urls[idx])
         if len(chosen) >= max_images:
             return chosen[:max_images]
-
     # riempimento con altre immagini non escluse
     def is_excluded(u: str) -> bool:
         return any(p.search(u) for p in EXCLUDE_PATTERNS)
-
     for u in urls:
         if len(chosen) >= max_images:
             break
@@ -143,9 +178,7 @@ def pick_by_positions(urls: List[str], positions: List[int], max_images: int) ->
         chosen.append(u)
     return chosen[:max_images]
 
-# ------------------------------
-# Immagini, dedup, HEX
-# ------------------------------
+# ------- Immagini, dedup, HEX -------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -165,19 +198,16 @@ def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
     def rgb_to_hex(rgb):
         r, g, b = rgb
         return "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b))
-
     img = img.convert("RGB")
     w, h = img.size
     max_side = 300
     if max(w, h) > max_side:
         scale = max_side / float(max(w, h))
         img = img.resize((int(w*scale), int(h*scale)), Image.BILINEAR)
-
     q = img.quantize(colors=palette_colors, method=Image.MEDIANCUT)
     palette = q.getpalette()
     counts = q.getcolors() or []
     best, best_count = None, -1
-
     for count, idx in counts:
         r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
         h_, l_, s_ = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
@@ -207,9 +237,7 @@ def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
         freq[c] = freq.get(c, 0) + 1
     return max(freq.items(), key=lambda x: x[1])[0]
 
-# ------------------------------
-# CSV Maxtrify (blocchi da 10)
-# ------------------------------
+# ------- CSV Maxtrify (blocchi da 10) -------
 def slugify_handle(text: str) -> str:
     import unicodedata
     t = unicodedata.normalize("NFKD", text)
@@ -239,16 +267,12 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
     return rows
 
 def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
-    """
-    Restituisce [(filename, csv_content), ...] con max 10 colori per file.
-    """
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
     fieldnames = [
         "ID", "Handle", "Command", "Display Name", "Status", "Updated At",
         "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"
     ]
-
     colors = sorted(colors_hex.keys())
     chunks = []
     for i in range(0, len(colors), 10):
@@ -273,8 +297,8 @@ st.title("Tekalab → Immagini per posizione + CSV Maxtrify")
 st.markdown("""
 Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
 Per ogni pagina:
-- estrae il **colore** dal titolo (copre Coral, Brunello, Pitch Black 2.0, ecc.),
-- prende le **immagini in posizioni** di gallery (default **3, 5, 6**),
+- estrae il **colore** (titolo → testo → slug, non rimuove suffissi come **“2.0”**),
+- prende le **immagini** in posizioni di gallery (default **3, 5, 6**),
 - salva **max 3** immagini per colore (dedup hash, ordine preservato),
 - calcola un **HEX** dominante,
 - genera CSV **Maxtrify** in file da **10 colori**,
@@ -343,12 +367,11 @@ if run:
             log(f"❌ Pagina non caricata: {url}")
             continue
 
-        title = find_title_text(soup)
-        if not title:
-            log(f"❌ Titolo non trovato: {url}")
+        color = get_color_from_page(soup, url)
+        if not color:
+            log(f"❌ Colore non trovato: {url}")
             continue
 
-        color = get_color_from_title(title)
         gallery_urls = gallery_fullsize_urls(soup)
         if not gallery_urls:
             log(f"⚠️ Nessuna immagine in gallery per {color}")
