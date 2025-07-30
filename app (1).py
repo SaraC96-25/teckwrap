@@ -5,7 +5,7 @@ import csv
 import hashlib
 import zipfile
 from io import BytesIO
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 import requests
@@ -72,7 +72,7 @@ def find_title_text(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 # ------- Estrazione colore (titolo, testo, slug) -------
-CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"
+CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"  # espandibile
 
 def _normalize_dashes(s: str) -> str:
     return s.replace("\u2013", "-").replace("\u2014", "-")
@@ -115,14 +115,15 @@ def _extract_from_text(soup: BeautifulSoup, code_hint: Optional[str]) -> Optiona
     return None
 
 def _extract_from_slug(url: str) -> Optional[str]:
+    # es. /flexishield-cosmetique-ppf-cl-18-lavender-lust-2-0-2/
     path = urlparse(url).path.lower()
     path = path.strip("/").split("/")
     slug = path[-1] if path else ""
     parts = re.split(r"cl[-]?\d+[a-z]?[-]?", slug)
     if len(parts) >= 2:
         tail = parts[1]
-        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)   # “2-0” -> “2.0”
-        tail = re.sub(r"-\d$", "", tail)              # rimuove un eventuale “-2” finale
+        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)  # “2-0” -> “2.0”
+        tail = re.sub(r"-\d$", "", tail)            # rimuove “-2” finale duplicato
         color = _clean_color_piece(tail.replace("-", " ").title())
         return color if color else None
     return None
@@ -182,7 +183,7 @@ def pick_by_positions(urls: List[str], positions: List[int], max_images: int) ->
         chosen.append(u)
     return chosen[:max_images]
 
-# ------- Filtri immagini -------
+# ------- Filtri immagini / HEX -------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -207,27 +208,21 @@ def looks_like_infographic_bytes(data: bytes) -> bool:
             w, h = g.size
             total = max(1, w * h)
 
-            # quota di pixel molto chiari (sfondo bianco)
             hist = g.histogram()
             white_pixels = sum(hist[240:])  # 240..255
             white_ratio = white_pixels / total
 
-            # densità di bordi
             edges = g.filter(ImageFilter.FIND_EDGES)
             mean_edge = ImageStat.Stat(edges).mean[0] / 255.0
 
-            # opzionale: se non quadrata (A4-like) alza la probabilità
-            ar = max(w, h) / max(1, min(w, h))
-            tall_or_wide = ar > 1.25
+            ar = max(w, h) / max(1, min(w, h))  # se “A4-like” alza la probabilità
 
-            # soglie empiriche (conservative)
-            if (white_ratio > 0.60 and mean_edge > 0.12) or (tall_or_wide and white_ratio > 0.50 and mean_edge > 0.10):
+            if (white_ratio > 0.60 and mean_edge > 0.12) or (ar > 1.25 and white_ratio > 0.50 and mean_edge > 0.10):
                 return True
     except Exception:
         return False
     return False
 
-# ------- HEX dominante -------
 def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
     import colorsys
     def rgb_to_hex(rgb):
@@ -282,7 +277,7 @@ def slugify_handle(text: str) -> str:
     t = re.sub(r"-{2,}", "-", t)
     return t.lower()
 
-def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -> list[dict]:
+def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -> List[Dict[str, str]]:
     base = {
         "ID": "",
         "Handle": slugify_handle(color_name),
@@ -293,7 +288,7 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
         "Definition: Handle": "shopify--color-pattern",
         "Definition: Name": "Color",
     }
-    rows = []
+    rows: List[Dict[str, str]] = []
     rows.append({**base, "Top Row": True, "Row #": 1, "Field": "label", "Value": color_name})
     rows.append({**base, "Top Row": "",   "Row #": 2, "Field": "color", "Value": hex_value})
     rows.append({**base, "Top Row": "",   "Row #": 3, "Field": "image", "Value": ""})
@@ -301,7 +296,7 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
     rows.append({**base, "Top Row": "",   "Row #": 5, "Field": "pattern_taxonomy_reference", "Value": "gid://shopify/TaxonomyValue/2874"})
     return rows
 
-def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
+def make_color_csv_chunks(colors_hex: Dict[str, str]) -> List[tuple[str, str]]:
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
     fieldnames = [
@@ -309,10 +304,10 @@ def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
         "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"
     ]
     colors = sorted(colors_hex.keys())
-    chunks = []
+    chunks: List[tuple[str, str]] = []
     for i in range(0, len(colors), 10):
         chunk = colors[i:i+10]
-        rows = []
+        rows: List[Dict[str, str]] = []
         for color in chunk:
             rows.extend(build_rows_for_color(color, updated_at, colors_hex[color]))
         buf = io.StringIO()
@@ -332,7 +327,7 @@ st.title("Tekalab → Immagini per posizione (no infografiche) + CSV Maxtrify")
 st.markdown("""
 Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
 Per ogni pagina:
-- estrae il **colore** (titolo → testo → slug; non rimuove “2.0”),
+- estrae il **colore** (titolo → testo → slug; non rimuove suffissi come **“2.0”**),
 - seleziona immagini per **posizione** (default **3, 5, 6**),
 - **ignora schede/infografiche** (filtri su nome + analisi immagine),
 - salva **max 3** immagini per colore (dedup hash),
@@ -387,8 +382,8 @@ if run:
 
     progress = st.progress(0)
     log_box = st.empty()
-    logs = []
-    def log(msg):
+    logs: List[str] = []
+    def log(msg: str):
         logs.append(msg)
         log_box.write("\n".join(logs[-25:]))
 
@@ -419,10 +414,9 @@ if run:
         fallback = [u for u in all_urls if u not in preferred and not is_info_keyword(u)]
 
         blobs: List[bytes] = []
-        seen_hashes = set()
+        seen_hashes: Set[str] = set()
 
-        def try_add(u: str):
-            nonlocal blobs, seen_hashes
+        def try_add(u: str) -> bool:
             try:
                 r = SESSION.get(u, timeout=30)
                 if r.status_code == 200 and r.content:
@@ -435,7 +429,7 @@ if run:
                     seen_hashes.add(h)
                     blobs.append(data)
                     return True
-            except:
+            except Exception:
                 return False
             return False
 
@@ -455,8 +449,7 @@ if run:
             log(f"⚠️ Nessuna immagine valida per {color}")
             continue
 
-        # tronca a MAX_IMAGES e salva info
-        blobs = blobs[:MAX_IMAGES]
+        blobs = dedup_by_hash_keep_order(blobs)[:MAX_IMAGES]
         colors_map[color] = blobs
         colors_hex[color] = dominant_hex_from_blobs(blobs)
         log(f"✅ {len(blobs)} immagini per {color}")
