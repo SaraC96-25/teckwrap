@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageFilter, ImageStat
 import streamlit as st
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -19,14 +19,21 @@ from zoneinfo import ZoneInfo
 # ------------------------------
 # Config base (posizioni 1-based)
 # ------------------------------
-DEFAULT_POSITIONS = [3, 5, 6]  # es. come nell’esempio "Racing Red"
-MAX_IMAGES = 3                 # max 3 immagini per colore
+DEFAULT_POSITIONS = [3, 5, 6]  # priorità posizionale in gallery
+MAX_IMAGES = 3                 # max immagini per colore
 
-# Esclusioni opzionali quando si riempiono buchi
+# Esclusioni per filename/URL quando si riempiono buchi
 EXCLUDE_PATTERNS = [
     re.compile(r"/1-28\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/146\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
     re.compile(r"/149\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
+]
+
+# Parole che identificano frequentemente schede/infografiche
+INFO_KEYWORDS = [
+    "product-sheet", "productsheet", "datasheet", "data-sheet",
+    "spec", "specs", "specification", "specifications",
+    "brochure", "leaflet", "flyer", "infographic", "information",
 ]
 
 # ------------------------------
@@ -64,8 +71,8 @@ def find_title_text(soup: BeautifulSoup) -> Optional[str]:
         return soup.title.text.strip()
     return None
 
-# ------- Estrazione colore (titolo, testo pagina, slug) -------
-CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"  # espandibile se necessario
+# ------- Estrazione colore (titolo, testo, slug) -------
+CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"
 
 def _normalize_dashes(s: str) -> str:
     return s.replace("\u2013", "-").replace("\u2014", "-")
@@ -85,11 +92,9 @@ def _extract_from_title(title: str) -> Optional[str]:
     if not title:
         return None
     t = _normalize_dashes(" ".join(title.split()).strip())
-    # caso: "… PPF CL-02 Racing Red" / "… CL-17 Brunello" / "… CL-08 Pitch Black 2.0"
     m = re.search(rf"(?:^|[-\s]){CODE_PREFIXES}[-\s]?\d+[A-Z]?\s+(.+)$", t, re.IGNORECASE)
     if m:
         return _clean_color_piece(m.group(1))
-    # fallback: porzione dopo l'ultimo trattino
     if "-" in t:
         seg = t.split("-")[-1].strip()
         if seg:
@@ -110,16 +115,14 @@ def _extract_from_text(soup: BeautifulSoup, code_hint: Optional[str]) -> Optiona
     return None
 
 def _extract_from_slug(url: str) -> Optional[str]:
-    # es. /flexishield-cosmetique-ppf-cl-18-lavender-lust-2-0-2/
     path = urlparse(url).path.lower()
     path = path.strip("/").split("/")
     slug = path[-1] if path else ""
     parts = re.split(r"cl[-]?\d+[a-z]?[-]?", slug)
     if len(parts) >= 2:
         tail = parts[1]
-        # normalizza "2-0" -> "2.0" (non rimuove "2.0")
-        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)
-        tail = re.sub(r"-\d$", "", tail)  # rimuove eventuale "-2" finale duplicato
+        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)   # “2-0” -> “2.0”
+        tail = re.sub(r"-\d$", "", tail)              # rimuove un eventuale “-2” finale
         color = _clean_color_piece(tail.replace("-", " ").title())
         return color if color else None
     return None
@@ -140,13 +143,8 @@ def get_color_from_page(soup: BeautifulSoup, url: str) -> str:
 
 # ------- Gallery -------
 def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
-    """
-    Avada/Woo: link full-size in:
-    div.woocommerce-product-gallery__wrapper >
-      div.woocommerce-product-gallery__image:not(.clone) a[href]
-    """
-    urls = []
     sel = "div.woocommerce-product-gallery__wrapper div.woocommerce-product-gallery__image:not(.clone) a[href]"
+    urls = []
     for a in soup.select(sel):
         href = (a.get("href") or "").strip()
         if href.lower().startswith("http"):
@@ -158,18 +156,24 @@ def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
             seen.add(u); out.append(u)
     return out
 
+def is_info_keyword(url: str) -> bool:
+    low = url.lower()
+    return any(k in low for k in INFO_KEYWORDS)
+
 def pick_by_positions(urls: List[str], positions: List[int], max_images: int) -> List[str]:
     chosen = []
-    # posizioni 1-based
+    # 1) posizioni richieste
     for pos in positions:
         idx = pos - 1
         if 0 <= idx < len(urls):
-            chosen.append(urls[idx])
+            u = urls[idx]
+            if not is_info_keyword(u):
+                chosen.append(u)
         if len(chosen) >= max_images:
             return chosen[:max_images]
-    # riempimento con altre immagini non escluse
+    # 2) riempimento con altre immagini non escluse
     def is_excluded(u: str) -> bool:
-        return any(p.search(u) for p in EXCLUDE_PATTERNS)
+        return any(p.search(u) for p in EXCLUDE_PATTERNS) or is_info_keyword(u)
     for u in urls:
         if len(chosen) >= max_images:
             break
@@ -178,7 +182,7 @@ def pick_by_positions(urls: List[str], positions: List[int], max_images: int) ->
         chosen.append(u)
     return chosen[:max_images]
 
-# ------- Immagini, dedup, HEX -------
+# ------- Filtri immagini -------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -193,6 +197,37 @@ def dedup_by_hash_keep_order(blobs: List[bytes]) -> List[bytes]:
             seen.add(h); out.append(data)
     return out
 
+def looks_like_infographic_bytes(data: bytes) -> bool:
+    """
+    Heuristica: molto bianco + molti bordi (testo/icone) => probabile scheda/prospetto.
+    """
+    try:
+        with Image.open(BytesIO(data)) as im:
+            g = im.convert("L")
+            w, h = g.size
+            total = max(1, w * h)
+
+            # quota di pixel molto chiari (sfondo bianco)
+            hist = g.histogram()
+            white_pixels = sum(hist[240:])  # 240..255
+            white_ratio = white_pixels / total
+
+            # densità di bordi
+            edges = g.filter(ImageFilter.FIND_EDGES)
+            mean_edge = ImageStat.Stat(edges).mean[0] / 255.0
+
+            # opzionale: se non quadrata (A4-like) alza la probabilità
+            ar = max(w, h) / max(1, min(w, h))
+            tall_or_wide = ar > 1.25
+
+            # soglie empiriche (conservative)
+            if (white_ratio > 0.60 and mean_edge > 0.12) or (tall_or_wide and white_ratio > 0.50 and mean_edge > 0.10):
+                return True
+    except Exception:
+        return False
+    return False
+
+# ------- HEX dominante -------
 def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
     import colorsys
     def rgb_to_hex(rgb):
@@ -218,7 +253,7 @@ def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
             r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
             if count > best_count:
                 best, best_count = (r, g, b), count
-    return rgb_to_hex(best) if best else ""
+    return "#{:02X}{:02X}{:02X}".format(*best) if best else ""
 
 def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
     candidates = []
@@ -237,7 +272,7 @@ def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
         freq[c] = freq.get(c, 0) + 1
     return max(freq.items(), key=lambda x: x[1])[0]
 
-# ------- CSV Maxtrify (blocchi da 10) -------
+# ------- CSV Maxtrify -------
 def slugify_handle(text: str) -> str:
     import unicodedata
     t = unicodedata.normalize("NFKD", text)
@@ -292,16 +327,17 @@ def make_color_csv_chunks(colors_hex: Dict[str, str]) -> list[tuple[str, str]]:
 # Streamlit UI
 # ------------------------------
 st.set_page_config(page_title="Tekalab Downloader + Color CSV", layout="wide")
-st.title("Tekalab → Immagini per posizione + CSV Maxtrify")
+st.title("Tekalab → Immagini per posizione (no infografiche) + CSV Maxtrify")
 
 st.markdown("""
 Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
 Per ogni pagina:
-- estrae il **colore** (titolo → testo → slug, non rimuove suffissi come **“2.0”**),
-- prende le **immagini** in posizioni di gallery (default **3, 5, 6**),
-- salva **max 3** immagini per colore (dedup hash, ordine preservato),
-- calcola un **HEX** dominante,
-- genera CSV **Maxtrify** in file da **10 colori**,
+- estrae il **colore** (titolo → testo → slug; non rimuove “2.0”),
+- seleziona immagini per **posizione** (default **3, 5, 6**),
+- **ignora schede/infografiche** (filtri su nome + analisi immagine),
+- salva **max 3** immagini per colore (dedup hash),
+- calcola **HEX** dominante,
+- genera CSV **Maxtrify** (10 colori per file),
 - scarica **tutto** in **un unico ZIP**.
 """)
 
@@ -356,7 +392,7 @@ if run:
         logs.append(msg)
         log_box.write("\n".join(logs[-25:]))
 
-    colors_map: Dict[str, List[bytes]] = {}   # colore -> [image_bytes...]
+    colors_map: Dict[str, List[bytes]] = {}   # colore -> blobs
     colors_hex: Dict[str, str] = {}           # colore -> hex
 
     total = len(urls)
@@ -372,30 +408,55 @@ if run:
             log(f"❌ Colore non trovato: {url}")
             continue
 
-        gallery_urls = gallery_fullsize_urls(soup)
-        if not gallery_urls:
+        all_urls = gallery_fullsize_urls(soup)
+        if not all_urls:
             log(f"⚠️ Nessuna immagine in gallery per {color}")
             continue
 
-        wanted = pick_by_positions(gallery_urls, positions, MAX_IMAGES)
-        if not wanted:
-            log(f"⚠️ Impossibile selezionare immagini per {color}")
-            continue
+        # Selezione prioritaria per posizioni, con esclusioni base
+        preferred = pick_by_positions(all_urls, positions, MAX_IMAGES)
+        # Coda di fallback (tutte le altre non già scelte)
+        fallback = [u for u in all_urls if u not in preferred and not is_info_keyword(u)]
 
-        blobs = []
-        for u in wanted:
+        blobs: List[bytes] = []
+        seen_hashes = set()
+
+        def try_add(u: str):
+            nonlocal blobs, seen_hashes
             try:
                 r = SESSION.get(u, timeout=30)
                 if r.status_code == 200 and r.content:
-                    blobs.append(r.content)
+                    data = r.content
+                    if looks_like_infographic_bytes(data):
+                        return False
+                    h = sha256_bytes(data)
+                    if h in seen_hashes:
+                        return False
+                    seen_hashes.add(h)
+                    blobs.append(data)
+                    return True
             except:
-                continue
+                return False
+            return False
 
-        blobs = dedup_by_hash_keep_order(blobs)[:MAX_IMAGES]
+        # prova posizioni richieste
+        for u in preferred:
+            if len(blobs) >= MAX_IMAGES:
+                break
+            try_add(u)
+
+        # riempimento se necessario
+        for u in fallback:
+            if len(blobs) >= MAX_IMAGES:
+                break
+            try_add(u)
+
         if not blobs:
-            log(f"⚠️ Nessuna immagine scaricata per {color}")
+            log(f"⚠️ Nessuna immagine valida per {color}")
             continue
 
+        # tronca a MAX_IMAGES e salva info
+        blobs = blobs[:MAX_IMAGES]
         colors_map[color] = blobs
         colors_hex[color] = dominant_hex_from_blobs(blobs)
         log(f"✅ {len(blobs)} immagini per {color}")
@@ -409,15 +470,13 @@ if run:
     # CSV (blocchi da 10)
     csv_chunks = make_color_csv_chunks(colors_hex)
 
-    # ZIP unico in memoria (cartelle colore + CSV in root)
+    # ZIP unico: cartelle colore + CSV in root
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-        # immagini
         for color, blobs in colors_map.items():
             for i, data in enumerate(blobs, start=1):
                 arcname = os.path.join(color, f"image_{i}.jpg")
                 z.writestr(arcname, data)
-        # CSV
         for name, content in csv_chunks:
             z.writestr(name, content)
     zip_bytes.seek(0)
