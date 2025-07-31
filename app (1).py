@@ -4,7 +4,6 @@ import csv
 import io
 import zipfile
 import unicodedata
-import hashlib
 import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,7 +23,7 @@ st.set_page_config(page_title="CoverStyl Downloader + CSV", layout="wide")
 # -----------------------
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 })
 
 # -----------------------
@@ -116,7 +115,7 @@ def zip_all(base_dir, csv_names, csv_buffers):
     return bio.read()
 
 # -----------------------
-# Image extraction for CoverStyl
+# CoverStyl image extraction (last image)
 # -----------------------
 def process_urls(urls, work_dir, progress=None, log=None):
     colors = []
@@ -142,17 +141,20 @@ def process_urls(urls, work_dir, progress=None, log=None):
         folder = os.path.join(work_dir, color_name)
         os.makedirs(folder, exist_ok=True)
 
-        # Immagine principale
-        img_div = soup.find("div", class_="gallery_Image__7KTqk")
-        if not img_div:
+        # Trova tutte le immagini della galleria
+        img_divs = soup.find_all("div", class_="gallery_Image__7KTqk")
+        if not img_divs:
             if log: log(f"⚠️ Nessuna immagine trovata per {color_name}")
             continue
+
+        # Prende l'ultima immagine della galleria
+        img_div = img_divs[-1]
         img_tag = img_div.find("img")
         if not img_tag:
             if log: log(f"⚠️ Nessuna immagine trovata per {color_name}")
             continue
 
-        # Usa srcset per la migliore risoluzione
+        # Risoluzione massima dal srcset
         srcset = img_tag.get("srcset") or img_tag.get("src")
         if " " in srcset:
             src = srcset.split(",")[-1].strip().split(" ")[0]
@@ -165,11 +167,11 @@ def process_urls(urls, work_dir, progress=None, log=None):
 
         try:
             img_bytes = SESSION.get(src, timeout=20).content
-            fp = os.path.join(folder, "image_1.jpg")
+            fp = os.path.join(folder, "image_last.jpg")
             with open(fp, "wb") as f:
                 f.write(img_bytes)
             colors.append(color_name)
-            if log: log(f"✅ Immagine salvata per {color_name}")
+            if log: log(f"✅ Ultima immagine salvata per {color_name}")
         except:
             if log: log(f"⚠️ Download fallito per {color_name}")
 
@@ -179,7 +181,7 @@ def process_urls(urls, work_dir, progress=None, log=None):
 # -----------------------
 # UI Streamlit
 # -----------------------
-st.title("CoverStyl Downloader + CSV")
+st.title("CoverStyl Downloader + CSV (ultima immagine)")
 
 csv_file = st.file_uploader("Carica CSV con colonna url", type=["csv"])
 run = st.button("Esegui")
