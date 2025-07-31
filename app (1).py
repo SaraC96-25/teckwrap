@@ -5,7 +5,6 @@ import io
 import zipfile
 import unicodedata
 import colorsys
-import hashlib
 import requests
 import tempfile
 import pandas as pd
@@ -16,248 +15,245 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import streamlit as st
 
-# -----------------------
-# CONFIG
-# -----------------------
-st.set_page_config(page_title="Tekalab Downloader + Color CSV", layout="wide")
+st.set_page_config(page_title="Downloader Tekalab PPF", layout="wide")
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
 
-# -----------------------
-# FUNZIONI HELPER
-# -----------------------
+# ---------------------------
+# PULIZIA NOME COLORE
+# ---------------------------
 def clean_color_name(title: str) -> str:
-    """
-    Estrae solo il nome colore ignorando FLEXISHIELD, SP-07, CL-08 ecc.
-    """
     title = title.strip()
 
-    # Se contiene un trattino lungo – prendi solo l'ultima parte
+    # Se c'è " – " prendiamo la parte dopo
     if " – " in title:
-        title = title.split(" – ")[-1]
+        title = title.split(" – ")[-1].strip()
 
-    parts = title.split()
+    # Rimuovi codici SP-, CL-, ecc.
+    title = re.sub(r"\b(?:SP|CL|DM|PPF|CP|DP|XP)[- ]?\d{1,3}\b", "", title, flags=re.IGNORECASE)
 
-    # Se ultima parte è un codice tipo SP-07, rimuovila
-    if len(parts) >= 2 and re.match(r"^[A-Z]{1,3}-?\d{1,3}$", parts[-1]):
-        color_name = " ".join(parts[:-1])
-    else:
-        color_name = " ".join(parts)
+    # Rimuovi parole generiche
+    generici = ["FLEXISHIELD", "Cosmétique", "PPF", "Film", "couleur", "protection", "Paint", "Protection"]
+    pattern_generici = r"\b(" + "|".join(generici) + r")\b"
+    title = re.sub(pattern_generici, "", title, flags=re.IGNORECASE)
 
-    # Se inizia con FLEXISHIELD lo rimuove
-    if color_name.lower().startswith("flexishield"):
-        color_name = " ".join(color_name.split()[1:])
+    # Rimuovi spazi multipli
+    title = re.sub(r"\s{2,}", " ", title).strip()
+    return title
 
-    return color_name.strip()
 
-def slugify_handle(text: str) -> str:
-    t = unicodedata.normalize("NFKD", text)
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    t = t.lower()
-    t = re.sub(r"[^a-z0-9\s\-]", "", t)
-    t = re.sub(r"\s+", "-", t).strip("-")
-    t = re.sub(r"-{2,}", "-", t)
-    return t
+# ---------------------------
+# HEX CALCULATION
+# ---------------------------
+def rgb_to_hex(rgb):
+    r, g, b = rgb
+    return "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b))
 
 def dominant_hex_from_image(img: Image.Image, palette_colors=8):
     img = img.convert("RGB")
-    w, h = img.size
-    max_side = 300
-    if max(w, h) > max_side:
-        scale = max_side / float(max(w, h))
-        img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    img.thumbnail((300, 300))
     q = img.quantize(colors=palette_colors, method=Image.MEDIANCUT)
     palette = q.getpalette()
     counts = q.getcolors() or []
-    best = None
-    best_count = -1
+    best, best_count = None, -1
     for count, idx in counts:
-        r, g, b = palette[idx * 3], palette[idx * 3 + 1], palette[idx * 3 + 2]
-        h, l, s = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+        r, g, b = palette[idx*3: idx*3+3]
+        h, l, s = colorsys.rgb_to_hls(r/255, g/255, b/255)
         if l > 0.92 or l < 0.08 or s < 0.15:
             continue
         if count > best_count:
-            best = (r, g, b)
-            best_count = count
-    if best is None:
-        for count, idx in counts:
-            r, g, b = palette[idx * 3], palette[idx * 3 + 1], palette[idx * 3 + 2]
-            if count > best_count:
-                best = (r, g, b)
-                best_count = count
-    if best:
-        return "#{:02X}{:02X}{:02X}".format(*best)
-    return ""
+            best, best_count = (r, g, b), count
+    return rgb_to_hex(best) if best else "#888888"
 
 def dominant_hex_from_folder(folder_path: str) -> str:
-    candidates = []
-    for name in os.listdir(folder_path):
-        if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-            continue
-        fp = os.path.join(folder_path, name)
-        try:
-            with Image.open(fp) as im:
-                hexv = dominant_hex_from_image(im)
-                if hexv:
-                    candidates.append(hexv)
-        except:
-            continue
-    if not candidates:
-        return ""
-    freq = {}
-    for c in candidates:
-        freq[c] = freq.get(c, 0) + 1
-    return max(freq.items(), key=lambda x: x[1])[0]
+    colors = []
+    for f in os.listdir(folder_path):
+        if f.lower().endswith((".jpg", ".jpeg", ".png")):
+            try:
+                with Image.open(os.path.join(folder_path, f)) as img:
+                    colors.append(dominant_hex_from_image(img))
+            except:
+                pass
+    if not colors:
+        return "#888888"
+    return max(set(colors), key=colors.count)
+
+
+# ---------------------------
+# GENERAZIONE CSV
+# ---------------------------
+def slugify_handle(text: str) -> str:
+    t = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    t = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+    return t
 
 def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str):
     handle = slugify_handle(color_name)
     base = {
-        "ID": "",
-        "Handle": handle,
-        "Command": "MERGE",
-        "Display Name": color_name,
-        "Status": "",
-        "Updated At": updated_at_str,
-        "Definition: Handle": "shopify--color-pattern",
-        "Definition: Name": "Color",
+        "ID": "", "Handle": handle, "Command": "MERGE", "Display Name": color_name,
+        "Status": "", "Updated At": updated_at_str, "Definition: Handle": "shopify--color-pattern",
+        "Definition: Name": "Color"
     }
-    rows = []
-    rows.append({**base, "Top Row": True, "Row #": 1, "Field": "label", "Value": color_name})
-    rows.append({**base, "Top Row": "", "Row #": 2, "Field": "color", "Value": hex_value})
-    rows.append({**base, "Top Row": "", "Row #": 3, "Field": "image", "Value": ""})
-    rows.append({**base, "Top Row": "", "Row #": 4, "Field": "color_taxonomy_reference", "Value": "gid://shopify/TaxonomyValue/3"})
-    rows.append({**base, "Top Row": "", "Row #": 5, "Field": "pattern_taxonomy_reference", "Value": "gid://shopify/TaxonomyValue/2874"})
+    rows = [
+        {**base, "Top Row": True, "Row #": 1, "Field": "label", "Value": color_name},
+        {**base, "Top Row": "", "Row #": 2, "Field": "color", "Value": hex_value},
+        {**base, "Top Row": "", "Row #": 3, "Field": "image", "Value": ""},
+        {**base, "Top Row": "", "Row #": 4, "Field": "color_taxonomy_reference",
+         "Value": "gid://shopify/TaxonomyValue/3"},
+        {**base, "Top Row": "", "Row #": 5, "Field": "pattern_taxonomy_reference",
+         "Value": "gid://shopify/TaxonomyValue/2874"}
+    ]
     return rows
 
 def generate_color_csvs(colors, base_dir):
-    colors = sorted(set(colors))
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
+    fieldnames = [
+        "ID", "Handle", "Command", "Display Name", "Status", "Updated At",
+        "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"
+    ]
     csv_files = []
-    chunk_size = 10
-    fieldnames = ["ID", "Handle", "Command", "Display Name", "Status", "Updated At",
-                  "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"]
-
-    for i in range(0, len(colors), chunk_size):
-        chunk = colors[i:i + chunk_size]
+    for i in range(0, len(colors), 10):
+        chunk = colors[i:i+10]
         rows = []
         for color in chunk:
             folder = os.path.join(base_dir, color)
-            hexv = dominant_hex_from_folder(folder)
-            rows.extend(build_rows_for_color(color, updated_at, hexv))
-
+            hex_val = dominant_hex_from_folder(folder)
+            rows.extend(build_rows_for_color(color, updated_at, hex_val))
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-        csv_files.append((f"color-patterns-{i//chunk_size+1:02}.csv", buf.getvalue()))
+        csv_files.append((f"color-patterns-{i//10+1}.csv", buf.getvalue()))
     return csv_files
 
-def extract_images_from_tekalab(soup: BeautifulSoup, positions: list[int]):
-    gallery = soup.find("div", class_="woocommerce-product-gallery__wrapper")
-    if not gallery:
+
+# ---------------------------
+# DOWNLOAD IMMAGINI TEKALAB
+# ---------------------------
+def is_excluded_image(img_tag):
+    """Esclude immagini tipo 'PRODUCT SHEET' o 'COSMETIC PPF' """
+    alt = img_tag.get("alt", "").lower()
+    src = img_tag.get("src", "").lower()
+    exclude_keywords = ["product sheet", "cosmetic paint protection film", "cosmetic ppf"]
+    return any(kw in alt or kw in src for kw in exclude_keywords)
+
+def extract_images_from_tekalab(soup, positions):
+    wrapper = soup.find("div", class_="woocommerce-product-gallery__wrapper")
+    if not wrapper:
         return []
-    all_images = gallery.find_all("img")
+    items = wrapper.find_all("div", class_="woocommerce-product-gallery__image")
     selected = []
-    for idx in positions:
-        if idx < len(all_images):
-            url = all_images[idx].get("data-large_image") or all_images[idx].get("src")
-            if url and "product-sheet" not in url.lower() and "cosmetic-paint-protection-film" not in url.lower():
-                selected.append(url)
+    for pos in positions:
+        if pos < len(items):
+            img_tag = items[pos].find("img")
+            if img_tag and not is_excluded_image(img_tag):
+                if img_tag.get("data-src"):
+                    selected.append(img_tag["data-src"])
+                elif img_tag.get("src"):
+                    selected.append(img_tag["src"])
     return selected
 
-def download_image(url):
-    try:
-        r = SESSION.get(url, timeout=20)
-        if r.status_code == 200:
-            return r.content
-    except:
-        return None
 
-# -----------------------
-# MAIN STREAMLIT APP
-# -----------------------
-st.title("Tekalab – Downloader + Color CSV")
+def process_urls(urls, positions, progress, log, base_dir):
+    colors = []
+    for idx, url in enumerate(urls):
+        progress.progress((idx+1) / len(urls))
+        try:
+            r = SESSION.get(url, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception as e:
+            log(f"❌ Errore connessione: {url}")
+            continue
 
-csv_file = st.file_uploader("Carica CSV con colonna url", type=["csv"])
-positions_str = st.text_input("Posizioni immagini (es: 0,1,2)", "0,1,2")
-run = st.button("Avvia processo")
+        h1 = soup.find("h1")
+        if not h1:
+            log(f"❌ Titolo non trovato: {url}")
+            continue
 
-if run:
-    if not csv_file:
-        st.error("Carica prima un CSV!")
-        st.stop()
+        color_name = clean_color_name(h1.text)
+        if not color_name:
+            log(f"⚠️ Nome colore vuoto: {url}")
+            continue
 
-    try:
-        df = pd.read_csv(csv_file)
-    except:
-        st.error("Errore nel leggere il CSV")
-        st.stop()
+        folder = os.path.join(base_dir, color_name)
+        os.makedirs(folder, exist_ok=True)
 
-    if "url" not in [c.lower() for c in df.columns]:
-        st.error("Colonna 'url' non trovata nel CSV")
-        st.stop()
+        img_urls = extract_images_from_tekalab(soup, positions)
+        if not img_urls:
+            log(f"⚠️ Nessuna immagine trovata per {color_name}")
+            continue
 
-    url_col = [c for c in df.columns if c.lower() == "url"][0]
-    urls = df[url_col].dropna().tolist()
-
-    posizioni = [int(x.strip()) for x in positions_str.split(",") if x.strip().isdigit()]
-
-    with tempfile.TemporaryDirectory() as work_dir:
-        colors = []
-        prog = st.progress(0)
-        log_area = st.empty()
-        logs = []
-
-        for i, url in enumerate(urls):
+        for i, img_url in enumerate(img_urls):
             try:
-                r = SESSION.get(url, timeout=30)
-                soup = BeautifulSoup(r.text, "html.parser")
+                img_data = SESSION.get(img_url).content
+                with open(os.path.join(folder, f"image_{i+1}.jpg"), "wb") as f:
+                    f.write(img_data)
             except:
-                logs.append(f"❌ Errore su {url}")
-                continue
+                pass
 
-            title_tag = soup.find("h1", class_="fusion-title-heading")
-            if not title_tag:
-                logs.append(f"❌ Titolo non trovato: {url}")
-                continue
+        colors.append(color_name)
+        log(f"✅ {len(img_urls)} immagini salvate per {color_name}")
 
-            color_name = clean_color_name(title_tag.text)
-            color_dir = os.path.join(work_dir, color_name)
-            os.makedirs(color_dir, exist_ok=True)
+    return list(set(colors))
 
-            images = extract_images_from_tekalab(soup, posizioni)
-            saved = 0
-            for j, img_url in enumerate(images):
-                img_bytes = download_image(img_url)
-                if img_bytes:
-                    fp = os.path.join(color_dir, f"image_{j + 1}.jpg")
-                    with open(fp, "wb") as f:
-                        f.write(img_bytes)
-                    saved += 1
 
-            if saved:
-                colors.append(color_name)
-                logs.append(f"✅ {saved} immagini scaricate per {color_name}")
-            else:
-                logs.append(f"⚠️ Nessuna immagine per {color_name}")
+def build_final_zip(base_dir, colors):
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w") as z:
+        # Aggiungi immagini
+        for color in colors:
+            folder = os.path.join(base_dir, color)
+            for root, _, files in os.walk(folder):
+                for f in files:
+                    z.write(os.path.join(root, f), os.path.join(color, f))
 
-            prog.progress((i + 1) / len(urls))
-            log_area.write("\n".join(logs[-15:]))
-
-        # ZIP immagini
-        zip_bytes = io.BytesIO()
-        with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-            for root, dirs, files in os.walk(work_dir):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    arcname = os.path.relpath(filepath, work_dir)
-                    z.write(filepath, arcname)
-        zip_bytes.seek(0)
-
-        st.download_button("📦 Scarica immagini (zip)", data=zip_bytes.getvalue(), file_name="tekalab-images.zip")
-
-        # CSV colori
-        csv_files = generate_color_csvs(colors, work_dir)
+        # Aggiungi CSV
+        csv_files = generate_color_csvs(colors, base_dir)
         for name, content in csv_files:
-            st.download_button(f"📄 Scarica {name}", data=content, file_name=name, mime="text/csv")
+            z.writestr(name, content)
+
+    bio.seek(0)
+    return bio.read()
+
+
+# ---------------------------
+# UI STREAMLIT
+# ---------------------------
+st.title("Downloader Tekalab – immagini + CSV colori")
+
+uploaded = st.file_uploader("Carica CSV con colonna url", type=["csv"])
+positions = st.multiselect("Seleziona posizioni immagini da scaricare",
+                            [0, 1, 2, 3, 4, 5], default=[0, 1, 2])
+
+if st.button("Avvia"):
+    if not uploaded:
+        st.error("Carica prima un file CSV!")
+        st.stop()
+
+    df = pd.read_csv(uploaded)
+    if "url" not in [c.lower() for c in df.columns]:
+        st.error("Il CSV deve avere colonna 'url'")
+        st.stop()
+
+    urls = df[df.columns[0]].dropna().tolist()
+
+    log_box = st.empty()
+    prog = st.progress(0)
+
+    logs = []
+    def log(msg):
+        logs.append(msg)
+        log_box.text("\n".join(logs[-10:]))
+
+    base_dir = tempfile.mkdtemp()
+    colors = process_urls(urls, positions, prog, log, base_dir)
+
+    if not colors:
+        st.warning("Nessun colore processato")
+        st.stop()
+
+    final_zip = build_final_zip(base_dir, colors)
+    st.download_button("📦 Scarica immagini + CSV (zip)", data=final_zip,
+                       file_name="tekalab-immagini-colori.zip", mime="application/zip")
