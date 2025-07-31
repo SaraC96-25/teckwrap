@@ -1,233 +1,95 @@
-import io
 import os
 import re
 import csv
-import hashlib
+import io
 import zipfile
-from io import BytesIO
-from typing import List, Dict, Optional, Set
-from urllib.parse import urlparse
-
+import unicodedata
+import colorsys
 import requests
+import tempfile
 import pandas as pd
+from io import BytesIO
 from bs4 import BeautifulSoup
-from PIL import Image, ImageFilter, ImageStat
-import streamlit as st
+from PIL import Image
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import streamlit as st
 
-# ------------------------------
-# Config base (posizioni 1-based)
-# ------------------------------
-DEFAULT_POSITIONS = [3, 5, 6]  # priorità posizionale in gallery
-MAX_IMAGES = 3                 # max immagini per colore
+# -----------------------
+# Configurazione Streamlit
+# -----------------------
+st.set_page_config(page_title="Downloader Tekalab + CSV colori", layout="wide")
 
-# Esclusioni per filename/URL quando si riempiono buchi
-EXCLUDE_PATTERNS = [
-    re.compile(r"/1-28\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
-    re.compile(r"/146\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
-    re.compile(r"/149\.(jpg|jpeg|png|webp)$", re.IGNORECASE),
-]
-
-# Parole che identificano frequentemente schede/infografiche
-INFO_KEYWORDS = [
-    "product-sheet", "productsheet", "datasheet", "data-sheet",
-    "spec", "specs", "specification", "specifications",
-    "brochure", "leaflet", "flyer", "infographic", "information",
-]
-
-# ------------------------------
+# -----------------------
 # HTTP session
-# ------------------------------
+# -----------------------
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 })
 
-# ------------------------------
-# Helpers di scraping Tekalab
-# ------------------------------
-def is_tekalab(url: str) -> bool:
-    return "tekalab.com" in urlparse(url).netloc.lower()
+# -----------------------
+# Helpers
+# -----------------------
 
-def fetch_soup(url: str) -> Optional[BeautifulSoup]:
-    try:
-        r = SESSION.get(url, timeout=30)
-        r.raise_for_status()
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        st.write(f"❌ Errore richiesta: {url} → {e}")
-        return None
+CODE_PREFIXES = r"(?:CL|SP)"
 
-def find_title_text(soup: BeautifulSoup) -> Optional[str]:
-    t = soup.select_one("h1.fusion-title-heading")
-    if t and t.text.strip():
-        return t.text.strip()
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        return og["content"].strip()
-    if soup.title and soup.title.text.strip():
-        return soup.title.text.strip()
-    return None
+def _normalize_dashes(t: str) -> str:
+    return t.replace("–", "-").replace("—", "-")
 
-# ------- Estrazione colore (titolo, testo, slug) -------
-CODE_PREFIXES = r"(?:CL|HG|DM|RCF|PPF)"  # espandibile
+def _clean_color_piece(piece: str) -> str:
+    # Rimuove eventuali codici rimasti tipo SP-05 o CL-02
+    piece = re.sub(rf"{CODE_PREFIXES}[-\s]?\d+[A-Z]?", "", piece, flags=re.IGNORECASE).strip()
+    return piece
 
-def _normalize_dashes(s: str) -> str:
-    return s.replace("\u2013", "-").replace("\u2014", "-")
-
-def _extract_code_from_url(url: str) -> Optional[str]:
-    slug = urlparse(url).path.lower()
-    m = re.search(r"/(cl)[-\s]?(\d+[a-z]?)(?:/|[-])", slug, re.IGNORECASE)
-    if m:
-        return (m.group(1).upper() + "-" + m.group(2).upper())
-    return None
-
-def _clean_color_piece(x: str) -> str:
-    x = re.split(r"[|•·\(\)\[\]{}]|€|TTC|HT", x, 1)[0]
-    return x.strip(" .,:;–—-").strip()
-
-def _extract_from_title(title: str) -> Optional[str]:
+def _extract_from_title(title: str):
     if not title:
         return None
+
     t = _normalize_dashes(" ".join(title.split()).strip())
+
+    # Escludiamo parole inutili
+    REMOVE_WORDS = [
+        "FLEXISHIELD", "Cosmétique", "PPF", "Film", "de", "protection",
+        "couleur", "violet", "pourpre", "noir", "profond", "aurore", "boréal"
+    ]
+    for w in REMOVE_WORDS:
+        t = re.sub(rf"\b{w}\b", "", t, flags=re.IGNORECASE).strip()
+
+    # Cerca colore DOPO il codice
     m = re.search(rf"(?:^|[-\s]){CODE_PREFIXES}[-\s]?\d+[A-Z]?\s+(.+)$", t, re.IGNORECASE)
     if m:
         return _clean_color_piece(m.group(1))
+
+    # Cerca colore PRIMA del codice
+    m = re.search(rf"(.+?)\s+{CODE_PREFIXES}[-\s]?\d+[A-Z]?$", t, re.IGNORECASE)
+    if m:
+        return _clean_color_piece(m.group(1))
+
+    # Fallback: ultima parte dopo un trattino
     if "-" in t:
         seg = t.split("-")[-1].strip()
         if seg:
             return _clean_color_piece(seg)
-    return None
 
-def _extract_from_text(soup: BeautifulSoup, code_hint: Optional[str]) -> Optional[str]:
-    text = " ".join(list(soup.stripped_strings))[:40000]
-    text = _normalize_dashes(text)
-    if code_hint:
-        ch = re.escape(code_hint)
-        m = re.search(rf"{ch}\s+([A-Z][A-Za-z0-9 .+'/–—\-]*?)\b(?=\s[A-Z][a-z]|[\.\,!;:\)]|\s[0-9€]|$)", text)
-        if m:
-            return _clean_color_piece(m.group(1))
-    m = re.search(rf"{CODE_PREFIXES}[-\s]?\d+[A-Z]?\s+([A-Z][A-Za-z0-9 .+'/–—\-]*?)\b(?=\s[A-Z][a-z]|[\.\,!;:\)]|\s[0-9€]|$)", text)
-    if m:
-        return _clean_color_piece(m.group(1))
-    return None
+    return t.strip()
 
-def _extract_from_slug(url: str) -> Optional[str]:
-    # es. /flexishield-cosmetique-ppf-cl-18-lavender-lust-2-0-2/
-    path = urlparse(url).path.lower()
-    path = path.strip("/").split("/")
-    slug = path[-1] if path else ""
-    parts = re.split(r"cl[-]?\d+[a-z]?[-]?", slug)
-    if len(parts) >= 2:
-        tail = parts[1]
-        tail = re.sub(r"\b(\d)-0\b", r"\1.0", tail)  # “2-0” -> “2.0”
-        tail = re.sub(r"-\d$", "", tail)            # rimuove “-2” finale duplicato
-        color = _clean_color_piece(tail.replace("-", " ").title())
-        return color if color else None
-    return None
+def _abs_url(u: str, base_url: str) -> str:
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        base = re.match(r"^(https?://[^/]+)", base_url)
+        return base.group(1) + u if base else u
+    return u
 
-def get_color_from_page(soup: BeautifulSoup, url: str) -> str:
-    title = find_title_text(soup)
-    c = _extract_from_title(title) if title else None
-    if c:
-        return c
-    code_hint = _extract_code_from_url(url)
-    c = _extract_from_text(soup, code_hint)
-    if c:
-        return c
-    c = _extract_from_slug(url)
-    if c:
-        return c
-    return (title or "").strip()
+def rgb_to_hex(rgb):
+    r, g, b = rgb
+    return "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b))
 
-# ------- Gallery -------
-def gallery_fullsize_urls(soup: BeautifulSoup) -> List[str]:
-    sel = "div.woocommerce-product-gallery__wrapper div.woocommerce-product-gallery__image:not(.clone) a[href]"
-    urls = []
-    for a in soup.select(sel):
-        href = (a.get("href") or "").strip()
-        if href.lower().startswith("http"):
-            urls.append(href)
-    # dedup preservando ordine
-    seen, out = set(), []
-    for u in urls:
-        if u not in seen:
-            seen.add(u); out.append(u)
-    return out
-
-def is_info_keyword(url: str) -> bool:
-    low = url.lower()
-    return any(k in low for k in INFO_KEYWORDS)
-
-def pick_by_positions(urls: List[str], positions: List[int], max_images: int) -> List[str]:
-    chosen = []
-    # 1) posizioni richieste
-    for pos in positions:
-        idx = pos - 1
-        if 0 <= idx < len(urls):
-            u = urls[idx]
-            if not is_info_keyword(u):
-                chosen.append(u)
-        if len(chosen) >= max_images:
-            return chosen[:max_images]
-    # 2) riempimento con altre immagini non escluse
-    def is_excluded(u: str) -> bool:
-        return any(p.search(u) for p in EXCLUDE_PATTERNS) or is_info_keyword(u)
-    for u in urls:
-        if len(chosen) >= max_images:
-            break
-        if u in chosen or is_excluded(u):
-            continue
-        chosen.append(u)
-    return chosen[:max_images]
-
-# ------- Filtri immagini / HEX -------
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-def dedup_by_hash_keep_order(blobs: List[bytes]) -> List[bytes]:
-    seen, out = set(), []
-    for data in blobs:
-        try:
-            h = sha256_bytes(data)
-        except Exception:
-            continue
-        if h not in seen:
-            seen.add(h); out.append(data)
-    return out
-
-def looks_like_infographic_bytes(data: bytes) -> bool:
-    """
-    Heuristica: molto bianco + molti bordi (testo/icone) => probabile scheda/prospetto.
-    """
-    try:
-        with Image.open(BytesIO(data)) as im:
-            g = im.convert("L")
-            w, h = g.size
-            total = max(1, w * h)
-
-            hist = g.histogram()
-            white_pixels = sum(hist[240:])  # 240..255
-            white_ratio = white_pixels / total
-
-            edges = g.filter(ImageFilter.FIND_EDGES)
-            mean_edge = ImageStat.Stat(edges).mean[0] / 255.0
-
-            ar = max(w, h) / max(1, min(w, h))  # se “A4-like” alza la probabilità
-
-            if (white_ratio > 0.60 and mean_edge > 0.12) or (ar > 1.25 and white_ratio > 0.50 and mean_edge > 0.10):
-                return True
-    except Exception:
-        return False
-    return False
-
-def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
-    import colorsys
-    def rgb_to_hex(rgb):
-        r, g, b = rgb
-        return "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b))
+def dominant_hex_from_image(img: Image.Image, palette_colors=8):
     img = img.convert("RGB")
     w, h = img.size
     max_side = 300
@@ -237,28 +99,36 @@ def dominant_hex_from_image(img: Image.Image, palette_colors=8) -> str:
     q = img.quantize(colors=palette_colors, method=Image.MEDIANCUT)
     palette = q.getpalette()
     counts = q.getcolors() or []
-    best, best_count = None, -1
+    best = None
+    best_count = -1
     for count, idx in counts:
         r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
-        h_, l_, s_ = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
-        if 0.08 < l_ < 0.92 and s_ > 0.15 and count > best_count:
-            best, best_count = (r, g, b), count
+        h, l, s = colorsys.rgb_to_hls(r/255.0, g/255.0, b/255.0)
+        if l > 0.92 or l < 0.08 or s < 0.15:
+            continue
+        if count > best_count:
+            best = (r, g, b); best_count = count
     if best is None:
         for count, idx in counts:
             r = palette[idx*3]; g = palette[idx*3+1]; b = palette[idx*3+2]
             if count > best_count:
-                best, best_count = (r, g, b), count
-    return "#{:02X}{:02X}{:02X}".format(*best) if best else ""
+                best = (r, g, b); best_count = count
+    return rgb_to_hex(best) if best else ""
 
-def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
+def dominant_hex_from_folder(folder_path: str) -> str:
     candidates = []
-    for data in blobs:
+    if not os.path.isdir(folder_path):
+        return ""
+    for name in sorted(os.listdir(folder_path)):
+        if not name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            continue
+        fp = os.path.join(folder_path, name)
         try:
-            with Image.open(BytesIO(data)) as im:
-                hv = dominant_hex_from_image(im, palette_colors=8)
-                if hv:
-                    candidates.append(hv.upper())
-        except Exception:
+            with Image.open(fp) as im:
+                hexv = dominant_hex_from_image(im, palette_colors=8)
+                if hexv:
+                    candidates.append(hexv.upper())
+        except:
             continue
     if not candidates:
         return ""
@@ -267,20 +137,58 @@ def dominant_hex_from_blobs(blobs: List[bytes]) -> str:
         freq[c] = freq.get(c, 0) + 1
     return max(freq.items(), key=lambda x: x[1])[0]
 
-# ------- CSV Maxtrify -------
+# -----------------------
+# Immagini
+# -----------------------
+def extract_images_from_tekalab(soup: BeautifulSoup, page_url: str, max_images=3):
+    images = []
+    seen_hashes = set()
+
+    gallery = soup.find("div", class_="fusion-woo-product-images")
+    if not gallery:
+        return []
+
+    for img_tag in gallery.find_all("img"):
+        src = img_tag.get("data-large_image") or img_tag.get("src")
+        if not src:
+            continue
+
+        # Filtra le immagini indesiderate (Product Sheet, Clear Coat)
+        alt_text = (img_tag.get("alt") or "").lower()
+        if "product sheet" in alt_text or "clear coat" in alt_text:
+            continue
+
+        url = _abs_url(src.split("?")[0], page_url)
+        try:
+            r = SESSION.get(url, timeout=30)
+            if r.status_code == 200 and r.content:
+                h = hash(r.content)
+                if h not in seen_hashes:
+                    seen_hashes.add(h)
+                    images.append(r.content)
+                    if len(images) >= max_images:
+                        break
+        except:
+            continue
+    return images
+
+# -----------------------
+# CSV generator
+# -----------------------
 def slugify_handle(text: str) -> str:
-    import unicodedata
     t = unicodedata.normalize("NFKD", text)
     t = "".join(c for c in t if not unicodedata.combining(c))
-    t = re.sub(r"[^a-zA-Z0-9\s\-]", "", t)
+    t = t.lower()
+    t = re.sub(r"[^a-z0-9\s\-]", "", t)
     t = re.sub(r"\s+", "-", t).strip("-")
     t = re.sub(r"-{2,}", "-", t)
-    return t.lower()
+    return t
 
-def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -> List[Dict[str, str]]:
+def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str):
+    handle = slugify_handle(color_name)
     base = {
         "ID": "",
-        "Handle": slugify_handle(color_name),
+        "Handle": handle,
         "Command": "MERGE",
         "Display Name": color_name,
         "Status": "",
@@ -288,7 +196,7 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
         "Definition: Handle": "shopify--color-pattern",
         "Definition: Name": "Color",
     }
-    rows: List[Dict[str, str]] = []
+    rows = []
     rows.append({**base, "Top Row": True, "Row #": 1, "Field": "label", "Value": color_name})
     rows.append({**base, "Top Row": "",   "Row #": 2, "Field": "color", "Value": hex_value})
     rows.append({**base, "Top Row": "",   "Row #": 3, "Field": "image", "Value": ""})
@@ -296,190 +204,146 @@ def build_rows_for_color(color_name: str, updated_at_str: str, hex_value: str) -
     rows.append({**base, "Top Row": "",   "Row #": 5, "Field": "pattern_taxonomy_reference", "Value": "gid://shopify/TaxonomyValue/2874"})
     return rows
 
-def make_color_csv_chunks(colors_hex: Dict[str, str]) -> List[tuple[str, str]]:
+def generate_color_csvs(colors, base_dir):
+    colors = sorted(set(c for c in colors if c.strip()))
+    if not colors:
+        return [], []
     tz = ZoneInfo("Europe/Rome")
     updated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
     fieldnames = [
         "ID", "Handle", "Command", "Display Name", "Status", "Updated At",
         "Definition: Handle", "Definition: Name", "Top Row", "Row #", "Field", "Value"
     ]
-    colors = sorted(colors_hex.keys())
-    chunks: List[tuple[str, str]] = []
-    for i in range(0, len(colors), 10):
-        chunk = colors[i:i+10]
-        rows: List[Dict[str, str]] = []
+    chunk_size = 10
+    csv_buffers = []
+    csv_names = []
+    for i in range(0, len(colors), chunk_size):
+        chunk = colors[i:i+chunk_size]
+        rows = []
         for color in chunk:
-            rows.extend(build_rows_for_color(color, updated_at, colors_hex[color]))
+            folder = os.path.join(base_dir, color)
+            hex_val = dominant_hex_from_folder(folder) or ""
+            rows.extend(build_rows_for_color(color, updated_at, hex_val))
+        idx = (i // chunk_size) + 1
+        name = f"color-patterns-{idx:02d}.csv"
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
-        name = f"color-patterns-{(i//10)+1:02d}.csv"
-        chunks.append((name, buf.getvalue()))
-    return chunks
+        csv_buffers.append(buf.getvalue())
+        csv_names.append(name)
+    return csv_names, csv_buffers
 
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-st.set_page_config(page_title="Tekalab Downloader + Color CSV", layout="wide")
-st.title("Tekalab → Immagini per posizione (no infografiche) + CSV Maxtrify")
+# -----------------------
+# Main workflow
+# -----------------------
+def process_urls(df_urls, work_dir, progress=None, log=None):
+    collected_colors = []
+    total = len(df_urls)
+    for idx, url in enumerate(df_urls):
+        if progress:
+            progress.progress((idx) / max(total, 1))
 
-st.markdown("""
-Carica un **CSV** con colonna `url` (solo pagine **tekalab.com**).  
-Per ogni pagina:
-- estrae il **colore** (titolo → testo → slug; non rimuove suffissi come **“2.0”**),
-- seleziona immagini per **posizione** (default **3, 5, 6**),
-- **ignora schede/infografiche** (filtri su nome + analisi immagine),
-- salva **max 3** immagini per colore (dedup hash),
-- calcola **HEX** dominante,
-- genera CSV **Maxtrify** (10 colori per file),
-- scarica **tutto** in **un unico ZIP**.
-""")
+        try:
+            r = SESSION.get(url, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            if log: log(f"❌ Errore caricamento pagina: {url}")
+            continue
 
-uploaded = st.file_uploader("Carica prodotti.csv (colonna url)", type=["csv"])
-pos_str = st.text_input("Posizioni gallery (1-based, separate da virgola)", value="3,5,6")
+        # Estrai titolo colore
+        h1 = soup.find("h1", class_="fusion-title-heading")
+        color_name = _extract_from_title(h1.text if h1 else "")
+        if not color_name:
+            if log: log(f"⚠️ Nessun nome colore trovato: {url}")
+            continue
+
+        # Scarica immagini
+        blobs = extract_images_from_tekalab(soup, url, max_images=3)
+        if not blobs:
+            if log: log(f"⚠️ Nessuna immagine valida trovata per {color_name}")
+            continue
+
+        color_dir = os.path.join(work_dir, color_name)
+        os.makedirs(color_dir, exist_ok=True)
+        for i, blob in enumerate(blobs, start=1):
+            fp = os.path.join(color_dir, f"image_{i}.jpg")
+            with open(fp, "wb") as f:
+                f.write(blob)
+
+        collected_colors.append(color_name)
+        if log: log(f"✅ {color_name} ({len(blobs)} immagini)")
+
+    if progress:
+        progress.progress(1.0)
+    return collected_colors
+
+def zip_folder(base_dir) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(base_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                arc = os.path.relpath(fp, base_dir)
+                z.write(fp, arc)
+    bio.seek(0)
+    return bio.read()
+
+# -----------------------
+# UI Streamlit
+# -----------------------
+st.title("Downloader Tekalab – Immagini + CSV colori")
+
+csv_file = st.file_uploader("Carica prodotti.csv (colonna url o URL)", type=["csv"])
 run = st.button("Esegui")
 
-def parse_positions(s: str) -> List[int]:
-    out = []
-    for part in s.split(","):
-        try:
-            n = int(part.strip())
-            if n > 0:
-                out.append(n)
-        except:
-            pass
-    return out or DEFAULT_POSITIONS
-
 if run:
-    if not uploaded:
-        st.error("Carica prima un CSV.")
+    if not csv_file:
+        st.error("Carica prima un file CSV.")
         st.stop()
 
     try:
-        df = pd.read_csv(uploaded)
+        df = pd.read_csv(csv_file)
     except Exception as e:
         st.error(f"Errore lettura CSV: {e}")
         st.stop()
 
-    # trova colonna url
     url_col = None
     for c in df.columns:
         if c.strip().lower() == "url":
             url_col = c
             break
     if not url_col:
-        st.error("Il CSV deve avere una colonna 'url'.")
+        st.error("Il CSV deve contenere una colonna 'url' (o 'URL').")
         st.stop()
 
     urls = [u for u in df[url_col].astype(str).tolist() if u.strip()]
-    urls = [u for u in urls if is_tekalab(u)]
     if not urls:
-        st.warning("Nessun URL tekalab.com valido nel CSV.")
+        st.error("Nessun URL trovato nel CSV.")
         st.stop()
 
-    positions = parse_positions(pos_str)
+    with tempfile.TemporaryDirectory() as work_dir:
+        st.info("Inizio download immagini e analisi…")
+        prog = st.progress(0)
+        log_area = st.empty()
+        logs = []
 
-    progress = st.progress(0)
-    log_box = st.empty()
-    logs: List[str] = []
-    def log(msg: str):
-        logs.append(msg)
-        log_box.write("\n".join(logs[-25:]))
+        def log(msg):
+            logs.append(msg)
+            log_area.write("\n".join(logs[-20:]))
 
-    colors_map: Dict[str, List[bytes]] = {}   # colore -> blobs
-    colors_hex: Dict[str, str] = {}           # colore -> hex
+        colors = process_urls(urls, work_dir, progress=prog, log=log)
 
-    total = len(urls)
-    for idx, url in enumerate(urls, start=1):
-        progress.progress((idx-1)/max(total,1))
-        soup = fetch_soup(url)
-        if not soup:
-            log(f"❌ Pagina non caricata: {url}")
-            continue
+        if not colors:
+            st.warning("Nessun colore valido processato.")
+            st.stop()
 
-        color = get_color_from_page(soup, url)
-        if not color:
-            log(f"❌ Colore non trovato: {url}")
-            continue
+        csv_names, csv_buffers = generate_color_csvs(colors, work_dir)
 
-        all_urls = gallery_fullsize_urls(soup)
-        if not all_urls:
-            log(f"⚠️ Nessuna immagine in gallery per {color}")
-            continue
+        zbytes = zip_folder(work_dir)
+        st.download_button("⬇️ Scarica immagini (zip)", data=zbytes, file_name="immagini.zip", mime="application/zip")
 
-        # Selezione prioritaria per posizioni, con esclusioni base
-        preferred = pick_by_positions(all_urls, positions, MAX_IMAGES)
-        # Coda di fallback (tutte le altre non già scelte)
-        fallback = [u for u in all_urls if u not in preferred and not is_info_keyword(u)]
+        for name, content in zip(csv_names, csv_buffers):
+            st.download_button(f"⬇️ Scarica {name}", data=content, file_name=name, mime="text/csv")
 
-        blobs: List[bytes] = []
-        seen_hashes: Set[str] = set()
-
-        def try_add(u: str) -> bool:
-            try:
-                r = SESSION.get(u, timeout=30)
-                if r.status_code == 200 and r.content:
-                    data = r.content
-                    if looks_like_infographic_bytes(data):
-                        return False
-                    h = sha256_bytes(data)
-                    if h in seen_hashes:
-                        return False
-                    seen_hashes.add(h)
-                    blobs.append(data)
-                    return True
-            except Exception:
-                return False
-            return False
-
-        # prova posizioni richieste
-        for u in preferred:
-            if len(blobs) >= MAX_IMAGES:
-                break
-            try_add(u)
-
-        # riempimento se necessario
-        for u in fallback:
-            if len(blobs) >= MAX_IMAGES:
-                break
-            try_add(u)
-
-        if not blobs:
-            log(f"⚠️ Nessuna immagine valida per {color}")
-            continue
-
-        blobs = dedup_by_hash_keep_order(blobs)[:MAX_IMAGES]
-        colors_map[color] = blobs
-        colors_hex[color] = dominant_hex_from_blobs(blobs)
-        log(f"✅ {len(blobs)} immagini per {color}")
-
-    progress.progress(1.0)
-
-    if not colors_map:
-        st.warning("Nessun colore processato.")
-        st.stop()
-
-    # CSV (blocchi da 10)
-    csv_chunks = make_color_csv_chunks(colors_hex)
-
-    # ZIP unico: cartelle colore + CSV in root
-    zip_bytes = io.BytesIO()
-    with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
-        for color, blobs in colors_map.items():
-            for i, data in enumerate(blobs, start=1):
-                arcname = os.path.join(color, f"image_{i}.jpg")
-                z.writestr(arcname, data)
-        for name, content in csv_chunks:
-            z.writestr(name, content)
-    zip_bytes.seek(0)
-
-    st.success("Completato!")
-    st.download_button(
-        "⬇️ Scarica tutto (immagini + CSV)",
-        data=zip_bytes.getvalue(),
-        file_name="tekalab-package.zip",
-        mime="application/zip",
-    )
-
-    st.write("Colori estratti:", sorted(colors_map.keys()))
+        st.success(f"✅ Completato! {len(colors)} colori processati")
